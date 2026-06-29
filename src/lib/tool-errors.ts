@@ -28,7 +28,7 @@ export function normalizeToolError(error: unknown): NormalizedToolError {
     findString(errorPayload, ["request_id", "requestId"]) ??
     findHeader(error, "x-request-id") ??
     findString(error, ["request_id", "requestId"]);
-  const suggestedFix =
+  const rawSuggestedFix =
     findString(errorPayload, ["suggested_fix", "suggestedFix"]) ??
     findString(error, ["suggested_fix", "suggestedFix"]);
   const message =
@@ -37,6 +37,7 @@ export function normalizeToolError(error: unknown): NormalizedToolError {
     safeString(error, 500) ??
     "Tool execution failed.";
   const category = categorizeError(status, code, slug, message);
+  const suggestedFix = rawSuggestedFix ?? defaultSuggestedFix(category);
 
   return {
     message,
@@ -77,7 +78,11 @@ function categorizeError(
   if (status === 429 || haystack.includes("rate")) {
     return "rate_limited";
   }
-  if (status === 401 || status === 403 || /auth|unauthorized|forbidden|reconnect|permission/.test(haystack)) {
+  if (
+    status === 401 ||
+    status === 403 ||
+    /auth|unauthorized|forbidden|reconnect|permission|scope|access[_ -]?denied|consent/.test(haystack)
+  ) {
     return "auth";
   }
   if (status === 404 || haystack.includes("not found")) {
@@ -94,6 +99,13 @@ function categorizeError(
 
 function isRetryable(category: ToolErrorCategory) {
   return category === "payload_too_large" || category === "rate_limited" || category === "server";
+}
+
+function defaultSuggestedFix(category: ToolErrorCategory) {
+  if (category === "auth") {
+    return "Reconnect the relevant account from the app header and grant the requested permissions, then try again.";
+  }
+  return undefined;
 }
 
 function findRecord(value: unknown, keys: string[]): Record<string, unknown> | undefined {

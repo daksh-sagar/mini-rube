@@ -1351,7 +1351,7 @@ function isNonRetryableToolError(err: unknown) {
     );
   }
 
-  return /unauthori[sz]ed|forbidden|permission|invalid[_ -]?(grant|token|request)|bad request|not found|unprocessable|missing required|validation/i.test(
+  return /unauthori[sz]ed|forbidden|permission|scope|access[_ -]?denied|consent|invalid[_ -]?(grant|token|request)|bad request|not found|unprocessable|missing required|validation/i.test(
     errorMessage(err)
   );
 }

@@ -302,7 +302,6 @@ export const ROUTER_INTENTS: RouterIntent[] = [
       "open and closed",
       "all issues",
       "make a sheet",
-      "composiohq/composio",
     ],
     examplePrompts: [
       "Read all the issues open and closed on composiohq/composio and make a Google Sheet with the problems people are reporting.",

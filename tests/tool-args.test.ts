@@ -64,6 +64,28 @@ describe("normalizeToolArgs", () => {
     expect(applyPromptLimitToToolArgs("GITHUB_LIST_REPOSITORY_ISSUES", {}, "read 5 emails")).toEqual({});
   });
 
+  const githubIssuePromptLimitCases = [
+    ["get titles of 5 recent github issues", 5],
+    ["read exactly 7 issues on composiohq/composio", 7],
+    ["list 4 open and closed pull requests", 4],
+    ["github issues, limit 3", 3],
+  ] as const;
+
+  for (const [prompt, limit] of githubIssuePromptLimitCases) {
+    test(`applies GitHub issue prompt count: ${prompt}`, () => {
+      expect(applyPromptLimitToToolArgs("GITHUB_LIST_REPOSITORY_ISSUES", {}, prompt)).toEqual({
+        per_page: limit,
+      });
+      expect(applyPromptLimitToToolArgs("GITHUB_SEARCH_ISSUES_AND_PULL_REQUESTS", { limit: 100 }, prompt)).toEqual({
+        limit,
+      });
+    });
+  }
+
+  test("does not apply GitHub issue prompt counts to unrelated prompts", () => {
+    expect(applyPromptLimitToToolArgs("GITHUB_LIST_REPOSITORY_ISSUES", {}, "read 5 emails")).toEqual({});
+  });
+
   test("normalizes collection reads generically", () => {
     expect(normalizeToolArgs("GITHUB_LIST_REPOSITORY_ISSUES", { per_page: 100 })).toEqual({
       per_page: 100,

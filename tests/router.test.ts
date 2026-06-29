@@ -406,6 +406,96 @@ describe("routeToolsForPrompt", () => {
     expect(result.slugs).not.toContain("GOOGLESUPER_SPREADSHEETS_VALUES_APPEND");
   });
 
+  test("routes bare repo follow-up after read-only GitHub issue request to issue read tools", async () => {
+    const result = await routeToolsForPrompt("composiohq/composio", {
+      catalog,
+      useLLM: false,
+      messages: [
+        {
+          role: "user",
+          content: "get titles of 5 recent github issues",
+        },
+        {
+          role: "assistant",
+          content: "Which GitHub repository would you like to check?",
+        },
+        {
+          role: "user",
+          content: "composiohq/composio",
+        },
+      ],
+    });
+
+    expect(result.routeScope).toBe("contextual_followup");
+    expect(result.intentIds).toContain("github.issues_read");
+    expect(result.intentIds).not.toContain("github.issues_to_sheet");
+    expect(result.slugs).toContain("GITHUB_LIST_REPOSITORY_ISSUES");
+    expect(result.slugs).toContain("GITHUB_SEARCH_ISSUES_AND_PULL_REQUESTS");
+    expect(result.slugs).toContain("GITHUB_GET_AN_ISSUE");
+    expect(result.slugs).not.toContain("GOOGLESUPER_SHEET_FROM_JSON");
+    expect(result.slugs).not.toContain("GOOGLESUPER_SPREADSHEETS_VALUES_APPEND");
+  });
+
+  test("constrains stale LLM sheet workflow on bare repo follow-up to issue read tools", async () => {
+    const result = await routeToolsForPrompt("composiohq/composio", {
+      catalog,
+      strategy: "llm_first",
+      messages: [
+        {
+          role: "user",
+          content: "get titles of 5 recent github issues",
+        },
+        {
+          role: "assistant",
+          content: "Which GitHub repository would you like to check?",
+        },
+        {
+          role: "user",
+          content: "composiohq/composio",
+        },
+      ],
+      llmRouter: async () => ({
+        intentIds: ["github.issues_to_sheet"],
+        toolSlugs: ["GITHUB_LIST_REPOSITORY_ISSUES", "GOOGLESUPER_SHEET_FROM_JSON"],
+        confidence: 0.95,
+        rationale: "stale sheet workflow",
+      }),
+    });
+
+    expect(result.routeScope).toBe("contextual_followup");
+    expect(result.intentIds).toContain("github.issues_read");
+    expect(result.intentIds).not.toContain("github.issues_to_sheet");
+    expect(result.slugs).toContain("GITHUB_LIST_REPOSITORY_ISSUES");
+    expect(result.slugs).not.toContain("GOOGLESUPER_SHEET_FROM_JSON");
+    expect(result.slugs).not.toContain("GOOGLESUPER_SPREADSHEETS_VALUES_APPEND");
+  });
+
+  test("does not inherit completed GitHub sheet context for a new bare repo prompt", async () => {
+    const result = await routeToolsForPrompt("composiohq/composio", {
+      catalog,
+      useLLM: false,
+      messages: [
+        {
+          role: "user",
+          content: "Read issues on octocat/Hello-World and make a Google Sheet",
+        },
+        {
+          role: "assistant",
+          content: "I started the GitHub issues to Google Sheet workflow.",
+        },
+        {
+          role: "user",
+          content: "composiohq/composio",
+        },
+      ],
+    });
+
+    expect(result.routeScope).toBe("standalone");
+    expect(result.intentIds).not.toContain("github.issues_to_sheet");
+    expect(result.slugs).not.toContain("GOOGLESUPER_SHEET_FROM_JSON");
+    expect(result.slugs).not.toContain("GOOGLESUPER_SPREADSHEETS_VALUES_APPEND");
+  });
+
   test("rejects LLM sheet workflow when latest GitHub prompt says not to write", async () => {
     const result = await routeToolsForPrompt("composiohq/composio, just get the issues, don't write them", {
       catalog,

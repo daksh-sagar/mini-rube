@@ -185,7 +185,7 @@ export async function routeToolsForPrompt(
     route = await routeDeterministicOrDiscovery(routingPrompt, options, catalog, scored, deterministic, maxTools, maxIntents);
   }
 
-  const constrained = filterRouteForPromptConstraints(route, prompt, catalog);
+  const constrained = filterRouteForPromptConstraints(route, routingPrompt, prompt, catalog);
   return { ...constrained, routeScope: constrained.routeScope ?? routeScope };
 }
 
@@ -455,7 +455,7 @@ function domainForToolSlug(slug: string): RouterIntent["domain"] | undefined {
 }
 
 function contextualRoutingPrompt(prompt: string, messages: RouterMessage[]) {
-  if (!shouldUseConversationContext(prompt)) {
+  if (!shouldUseConversationContext(prompt, messages)) {
     return prompt;
   }
 
@@ -467,7 +467,10 @@ function contextualRoutingPrompt(prompt: string, messages: RouterMessage[]) {
   return `${context}\nuser: ${prompt}`;
 }
 
-function shouldUseConversationContext(prompt: string) {
+function shouldUseConversationContext(prompt: string, messages: RouterMessage[]) {
+  if (isBareGithubRepoReference(prompt)) {
+    return latestAssistantAskedGithubRepository(messages, prompt);
+  }
   if (!isContextualFollowup(prompt)) {
     return false;
   }
@@ -478,6 +481,31 @@ function shouldUseConversationContext(prompt: string) {
     return false;
   }
   return true;
+}
+
+function isBareGithubRepoReference(prompt: string) {
+  return /^(?:https?:\/\/github\.com\/)?[a-z0-9_.-]+\/[a-z0-9_.-]+\/?$/i.test(prompt.trim());
+}
+
+function latestAssistantAskedGithubRepository(messages: RouterMessage[], prompt: string) {
+  const current = prompt.trim();
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    const content = message.content.trim();
+    if (!content) {
+      continue;
+    }
+    if (message.role === "user" && content === current) {
+      continue;
+    }
+    if (message.role !== "assistant") {
+      return false;
+    }
+    return /\bwhich\s+github\s+repository\b|\bgithub\s+repository\b.{0,80}\b(?:check|pull|read|fetch|use)\b|\bowner\b.{0,80}\brepo(?:sitory)?\b/i.test(
+      content
+    );
+  }
+  return false;
 }
 
 function ambiguousFollowupClarification(prompt: string, messages: RouterMessage[]) {
@@ -619,9 +647,15 @@ function isReadOnlyAgainstSheetWorkflow(prompt: string) {
   );
 }
 
-function filterRouteForPromptConstraints(route: RouteToolsResult, prompt: string, catalog: ToolCatalogEntry[]) {
+function filterRouteForPromptConstraints(
+  route: RouteToolsResult,
+  routedPrompt: string,
+  latestPrompt: string,
+  catalog: ToolCatalogEntry[]
+) {
   if (
-    !isReadOnlyAgainstSheetWorkflow(prompt) ||
+    isSheetFromPriorItemsFollowup(latestPrompt) ||
+    !isReadOnlyAgainstSheetWorkflow(routedPrompt) ||
     (!route.intentIds?.includes("github.issues_to_sheet") && !route.slugs.some((slug) => slug.startsWith("GITHUB_")))
   ) {
     return route;
@@ -637,7 +671,7 @@ function filterRouteForPromptConstraints(route: RouteToolsResult, prompt: string
     ...route,
     slugs,
     intentIds: ["github.issues_read"],
-    rationale: `${route.rationale}; constrained to read-only by latest prompt`,
+    rationale: `${route.rationale}; constrained to read-only by routed prompt`,
   };
 }
 

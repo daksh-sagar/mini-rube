@@ -758,10 +758,17 @@ button {
 
 .job-metrics div {
   min-width: 0;
+  overflow: hidden;
   padding: 7px 8px;
   border: 1px solid #dce2e8;
   border-radius: 6px;
   background: #ffffff;
+}
+
+.job-metrics dt {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .job-metrics dd {
@@ -769,6 +776,10 @@ button {
   color: #24313f;
   font-size: 12px;
   font-weight: 650;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .job-approval {

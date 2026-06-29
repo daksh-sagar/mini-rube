@@ -1,6 +1,10 @@
 import type { NormalizedToolError } from "./tool-errors";
 
 const GMAIL_FETCH_EMAILS_TOOL = "GOOGLESUPER_FETCH_EMAILS";
+const GITHUB_ISSUE_COLLECTION_TOOLS = new Set([
+  "GITHUB_LIST_REPOSITORY_ISSUES",
+  "GITHUB_SEARCH_ISSUES_AND_PULL_REQUESTS",
+]);
 const COUNT_FIELDS = ["max_results", "maxResults", "limit", "per_page", "page_size", "pageSize"];
 const VERBOSITY_FIELDS = [
   "verbose",
@@ -78,17 +82,27 @@ export function applyPromptLimitToToolArgs(
   args: Record<string, unknown>,
   prompt?: string
 ) {
-  if (toolSlug !== GMAIL_FETCH_EMAILS_TOOL) {
-    return { ...args };
+  if (toolSlug === GMAIL_FETCH_EMAILS_TOOL) {
+    const promptLimit = explicitGmailLimit(prompt ?? "");
+    if (!promptLimit) {
+      return { ...args };
+    }
+
+    const countField = COUNT_FIELDS.find((field) => field in args) ?? "max_results";
+    return { ...args, [countField]: promptLimit };
   }
 
-  const promptLimit = explicitGmailLimit(prompt ?? "");
-  if (!promptLimit) {
-    return { ...args };
+  if (GITHUB_ISSUE_COLLECTION_TOOLS.has(toolSlug)) {
+    const promptLimit = explicitGithubIssueLimit(prompt ?? "");
+    if (!promptLimit) {
+      return { ...args };
+    }
+
+    const countField = COUNT_FIELDS.find((field) => field in args) ?? "per_page";
+    return { ...args, [countField]: promptLimit };
   }
 
-  const countField = COUNT_FIELDS.find((field) => field in args) ?? "max_results";
-  return { ...args, [countField]: promptLimit };
+  return { ...args };
 }
 
 export function buildRetryArgs(
@@ -152,6 +166,36 @@ function explicitGmailLimit(prompt: string) {
     /\b(?:read|fetch|get|list|show|scan|summari[sz]e)\s+(?:the\s+)?(?:(?:exactly|only|just|up to|at most|no more than|limit(?:ed)? to|last|latest|recent|newest|top|first)\s+)?(\d{1,4})\s+(?:gmail\s+)?(?:emails?|messages?)\b/,
     /\b(\d{1,4})\s+(?:gmail\s+)?(?:emails?|messages?)\b/,
     /\b(?:emails?|messages?|gmail|inbox)\b.{0,40}\blimit(?:ed)?(?:\s+to)?\s+(\d{1,4})\b/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = lower.match(pattern);
+    if (match) {
+      const limit = toPositiveInt(match[1], 0);
+      if (limit > 0) {
+        return limit;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function explicitGithubIssueLimit(prompt: string) {
+  const lower = prompt.toLowerCase();
+  if (
+    !/\b(?:github|repo|repository|issue|issues|pull request|pull requests|\bpr\b|\bprs\b)\b/.test(lower) &&
+    !/[a-z0-9_.-]+\/[a-z0-9_.-]+/.test(lower)
+  ) {
+    return undefined;
+  }
+
+  const issueNoun = String.raw`(?:github\s+|repo\s+|repository\s+)?(?:issues?|pull\s+requests?|\bprs?\b)`;
+  const issueQualifiers = String.raw`(?:(?:open|closed|recent|latest|newest|last|top|first)\s+|open\s+and\s+closed\s+|open\s+or\s+closed\s+)*`;
+  const patterns = [
+    new RegExp(String.raw`\b(?:read|fetch|get|list|show|scan|summari[sz]e)\b.{0,60}\b(\d{1,4})\s+${issueQualifiers}${issueNoun}\b`),
+    new RegExp(String.raw`\b(\d{1,4})\s+${issueQualifiers}${issueNoun}\b`),
+    new RegExp(String.raw`\b${issueNoun}\b.{0,50}\blimit(?:ed)?(?:\s+to)?\s+(\d{1,4})\b`),
   ];
 
   for (const pattern of patterns) {

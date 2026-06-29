@@ -36,4 +36,22 @@ describe("normalizeToolError", () => {
     expect(normalizeToolError({ status: 500, message: "server error" }).category).toBe("server");
     expect(normalizeToolError({ status: 400, message: "bad args" }).category).toBe("bad_request");
   });
+
+  test("classifies OAuth scope failures as auth errors with reconnect guidance", () => {
+    const normalized = normalizeToolError({
+      status: 400,
+      error: {
+        error: {
+          code: "insufficient_scope",
+          message: "Request had insufficient authentication scopes.",
+        },
+      },
+    });
+
+    expect(normalized).toMatchObject({
+      category: "auth",
+      retryable: false,
+      suggestedFix: "Reconnect the relevant account from the app header and grant the requested permissions, then try again.",
+    });
+  });
 });

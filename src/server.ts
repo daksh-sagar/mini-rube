@@ -241,6 +241,10 @@ function combinedFollowupPrompt(messages: CoreMessage[], prompt: string) {
   return previous ? `${previous}\n${prompt}` : prompt;
 }
 
+function effectiveRunPrompt(messages: CoreMessage[], prompt: string, route: Pick<RouteToolsResult, "routeScope">) {
+  return route.routeScope === "contextual_followup" ? combinedFollowupPrompt(messages, prompt) : prompt;
+}
+
 function promptHasContextualReference(prompt: string) {
   return /\b(?:again|above|it|that|them|these|those|this|same|previous|prior|ones)\b/i.test(prompt);
 }
@@ -1123,6 +1127,9 @@ async function maybeResumeWorkflowFromFollowup(
   const workflowPrompt = combinedFollowupPrompt(messages, prompt);
 
   if (previous.includes("which GitHub repository")) {
+    if (!previousUserRequestedGithubSheet(messages)) {
+      return null;
+    }
     if (!isGithubWorkflowSourceReply(prompt)) {
       return null;
     }
@@ -1136,6 +1143,9 @@ async function maybeResumeWorkflowFromFollowup(
       }
     }
   } else if (previous.includes("which Drive folder are the resumes in")) {
+    if (!previousUserRequestedDriveSheet(messages)) {
+      return null;
+    }
     const resolution = await resolveDriveFolderReply(prompt, (slug, args) =>
       executeTool(slug, userId, args)
     );
@@ -1149,6 +1159,23 @@ async function maybeResumeWorkflowFromFollowup(
     }
   }
   return null;
+}
+
+function previousUserRequestedGithubSheet(messages: CoreMessage[]) {
+  const previous = previousUserBeforeLatest(messages);
+  return hasSheetWriteIntent(previous) && /\b(?:github|repo|repository|issue|issues|pull request|pull requests)\b/i.test(previous);
+}
+
+function previousUserRequestedDriveSheet(messages: CoreMessage[]) {
+  const previous = previousUserBeforeLatest(messages);
+  return hasSheetWriteIntent(previous) && /\b(?:drive|folder|resume|resumes|candidate|candidates|pdf|pdfs|document|documents)\b/i.test(previous);
+}
+
+function hasSheetWriteIntent(prompt: string) {
+  return (
+    /\b(?:sheet|spreadsheet|table|csv)\b/i.test(prompt) &&
+    /\b(?:write|create|make|export|append|put|save)\b/i.test(prompt)
+  );
 }
 
 function isGithubWorkflowSourceReply(prompt: string) {
@@ -2212,7 +2239,8 @@ Bun.serve({
           });
           return makeLocalTextResponse(missingToolSchemaText(route, run.id), run.id, routeResponseHeaders);
         }
-        const run = createRun(userId, prompt, toolSchemas.map(getToolSlug).filter(Boolean), route.rationale);
+        const runPrompt = effectiveRunPrompt(messages, prompt, route);
+        const run = createRun(userId, runPrompt, toolSchemas.map(getToolSlug).filter(Boolean), route.rationale);
 
         if (files.length) {
           addTrace(run, {
@@ -2253,6 +2281,7 @@ Format answers in Markdown: use short paragraphs, bullet lists for multiple item
 When listing records that include a URL/htmlUrl/webUrl field, make each record title a Markdown link unless the user explicitly asks for plain text only.
 For missing required details, ask concise follow-up questions.
 For read-only requests, always answer with the relevant records or summary from the tool result. Never reply only with "Done", "Fetched", or a generic completion acknowledgement after a successful read.
+If a tool result has category "auth" or mentions missing/insufficient OAuth scopes, tell the user the connected account does not have the required permission and ask them to reconnect the relevant account from the app header. Do not retry the same tool call or claim the action succeeded.
 For large tasks, paginate and process in batches. Do not request huge context windows. When writing sheets, preserve one row per source item and include an error/status column rather than dropping failed items.
 When the user asks for a specific quantity (e.g. "my last 100 emails"), request that many; if a single read returns fewer than asked and the response includes a next-page token, fetch the next page(s) until you have the requested count or the source is exhausted. Give ONE clean final answer — do not narrate each fetch attempt ("let me try the next page…") as separate prose, and never surface raw API internals (next-page tokens, result-size estimates, fields like "itemCount" or "resultSizeEstimate", "truncated at item boundaries") to the user. A compacted preview count is not the mailbox total. If the source genuinely holds fewer items than requested, simply state the real count plainly (e.g. "Your mailbox has 23 emails — here they are:") and list them; do not present an estimate as if it were the total.
 Before sending email, creating calendar events, creating/updating sheets, or any other external mutation, the tool returns a pending action that the user must approve in the UI. Clearly describe what you are about to do and that it is awaiting confirmation. Do not claim it has been completed until the user confirms.
