@@ -12,6 +12,7 @@ import { compactToolResult } from "./lib/tool-results";
 import { maybePaginateCollectionRead } from "./lib/tool-pagination";
 import { getToolInputSchema, getToolSlug, loadToolSchemas, supportedToolkits } from "./lib/tool-catalog";
 import { routeToolsForPrompt } from "./lib/router";
+import { DEFAULT_CALENDAR_TIMEZONE, parseCalendarEventDraft, type CalendarEventDraft } from "./lib/calendar-intent";
 import { createSqliteWorkflowStore, type WorkflowJob } from "./lib/job-store";
 import {
   createWorkflowService,
@@ -25,7 +26,7 @@ import {
   type WorkflowDefinition,
   type WorkflowArtifact,
 } from "./lib/workflows";
-import type { ComposioToolSchema, PendingAction, RunState, RunTraceEntry } from "./lib/types";
+import type { ComposioToolSchema, PendingAction, RouteToolsResult, RunState, RunTraceEntry } from "./lib/types";
 
 type PendingConnection = {
   link: Awaited<ReturnType<typeof connectAccount>>;
@@ -36,10 +37,25 @@ type PendingConnection = {
   createdAt: string;
 };
 
+type ActiveTaskIntentId = "calendar.schedule";
+
+type ActiveTask = {
+  id: string;
+  userId: string;
+  intentId: ActiveTaskIntentId;
+  promptHistory: string[];
+  selectedTools: string[];
+  rationale: string;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: number;
+};
+
 const pendingConnections = new Map<string, PendingConnection>();
 const uploadedFiles = new Map<string, UploadedFileRef>();
 const pendingActions = new Map<string, PendingAction>();
 const runs = new Map<string, RunState>();
+const activeTasks = new Map<string, ActiveTask>();
 const workflowApprovals = new Map<
   string,
   { request: ApprovalRequest; resolve: (grant: ApprovalGrant) => void }
@@ -50,6 +66,17 @@ const cancelledWorkflowJobs = new Set<string>();
 const PORT = Number(process.env.PORT ?? 3001);
 const IDLE_TIMEOUT_SECONDS = Number(process.env.BUN_IDLE_TIMEOUT ?? 120);
 const STATIC_DIR = resolve(import.meta.dir, "app/dist");
+const ACTIVE_TASK_TTL_MS = 10 * 60 * 1000;
+const ACTIVE_TASK_HISTORY_LIMIT = 12;
+const CALENDAR_SCHEDULE_INTENT_ID: ActiveTaskIntentId = "calendar.schedule";
+const CALENDAR_SCHEDULE_SLUGS = [
+  "GOOGLESUPER_CREATE_EVENT",
+  "GOOGLESUPER_FIND_FREE_SLOTS",
+  "GOOGLESUPER_EVENTS_LIST",
+  "GOOGLESUPER_GET_CONTACTS",
+  "GOOGLESUPER_SEARCH_PEOPLE",
+  "GOOGLESUPER_GET_CURRENT_DATE_TIME",
+];
 const workflowStore = await createSqliteWorkflowStore({
   databasePath: process.env.WORKFLOW_DB_PATH ?? ".mini-rube/workflows.sqlite",
 });
@@ -157,6 +184,19 @@ function latestAssistantText(messages: CoreMessage[]) {
   return "";
 }
 
+function messageText(message: CoreMessage) {
+  if (typeof message.content === "string") {
+    return message.content;
+  }
+  if (Array.isArray(message.content)) {
+    return message.content
+      .map((part) => ("text" in part && typeof part.text === "string" ? part.text : ""))
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
 // Reinforce attachment context inside the conversation itself. A multi-turn
 // model can trust its earlier "please upload a file" turns over a system-prompt
 // note, so we append the fact to the latest user message where it can't be missed.
@@ -220,6 +260,9 @@ function getErrorMessage(error: unknown) {
   }
   if (/requires more credits|can only afford|insufficient.*(credit|fund|balance)|negative balance|prompt tokens limit exceeded/.test(haystack)) {
     return "The model request was rejected for this account's credit balance. Add OpenRouter credits, switch to a free model, or lower AGENT_MAX_TOKENS/JSON_MAX_TOKENS.";
+  }
+  if (/model tried to call unavailable tool|unavailable tool .*available tools/i.test(haystack)) {
+    return "The model selected a tool that was not available for this turn, so the app did not run anything. Please retry the request; the active task context will be kept for the next turn.";
   }
   return message || "The model request failed. Check the server logs for details.";
 }
@@ -671,6 +714,261 @@ async function startWorkflowResponse(
   return makeLocalTextResponse(workflowQueuedText(run.id, job.id, workflow), run.id, {
     "x-job-id": job.id,
   });
+}
+
+function calendarDraftResponse(
+  userId: string,
+  prompt: string,
+  route: { slugs: string[]; rationale: string },
+  draft: CalendarEventDraft
+) {
+  const run = createRun(userId, prompt, route.slugs, `${route.rationale} (deterministic calendar draft)`);
+  createPendingAction(userId, run, "GOOGLESUPER_CREATE_EVENT", draft.args);
+  return makeLocalTextResponse(calendarDraftText(draft), run.id);
+}
+
+function calendarDraftText(draft: CalendarEventDraft) {
+  return `I prepared the calendar event and it is waiting for your confirmation in the UI.
+
+- Title: ${draft.display.summary}
+- Start: ${draft.display.start} (${DEFAULT_CALENDAR_TIMEZONE})
+- Duration: ${draft.display.durationMinutes} minutes
+
+Click Confirm to create the event.`;
+}
+
+function activeTaskKey(userId: string, intentId: ActiveTaskIntentId) {
+  return `${userId}:${intentId}`;
+}
+
+function getActiveTask(userId: string, intentId: ActiveTaskIntentId) {
+  const key = activeTaskKey(userId, intentId);
+  const task = activeTasks.get(key);
+  if (!task) {
+    return null;
+  }
+  if (task.expiresAt <= Date.now()) {
+    activeTasks.delete(key);
+    return null;
+  }
+  return task;
+}
+
+function clearActiveTask(userId: string, intentId: ActiveTaskIntentId) {
+  activeTasks.delete(activeTaskKey(userId, intentId));
+}
+
+function routeIsCalendarSchedule(route: Pick<RouteToolsResult, "intentIds" | "slugs">) {
+  return (
+    route.intentIds?.includes(CALENDAR_SCHEDULE_INTENT_ID) ||
+    route.slugs.includes("GOOGLESUPER_CREATE_EVENT")
+  );
+}
+
+function calendarToolsForRoute(route: Pick<RouteToolsResult, "slugs">) {
+  const selected = route.slugs.filter((slug) => CALENDAR_SCHEDULE_SLUGS.includes(slug));
+  const merged = ["GOOGLESUPER_CREATE_EVENT", ...selected, ...CALENDAR_SCHEDULE_SLUGS];
+  return merged.filter((slug, index, all) => all.indexOf(slug) === index);
+}
+
+function appendActiveTaskPrompt(task: ActiveTask, prompt: string) {
+  const trimmed = prompt.trim();
+  if (!trimmed) {
+    return task;
+  }
+  if (task.promptHistory.at(-1) !== trimmed) {
+    task.promptHistory = [...task.promptHistory, trimmed].slice(-ACTIVE_TASK_HISTORY_LIMIT);
+  }
+  task.updatedAt = nowIso();
+  task.expiresAt = Date.now() + ACTIVE_TASK_TTL_MS;
+  activeTasks.set(activeTaskKey(task.userId, task.intentId), task);
+  return task;
+}
+
+function saveCalendarTask(userId: string, prompt: string, route: Pick<RouteToolsResult, "slugs" | "rationale">) {
+  const existing = getActiveTask(userId, CALENDAR_SCHEDULE_INTENT_ID);
+  if (existing && !isCalendarScheduleAnchor(prompt)) {
+    existing.selectedTools = calendarToolsForRoute(route);
+    existing.rationale = route.rationale || existing.rationale;
+    return appendActiveTaskPrompt(existing, prompt);
+  }
+
+  const now = nowIso();
+  const task: ActiveTask = {
+    id: makeId("task"),
+    userId,
+    intentId: CALENDAR_SCHEDULE_INTENT_ID,
+    promptHistory: [],
+    selectedTools: calendarToolsForRoute(route),
+    rationale: route.rationale || "calendar.schedule",
+    createdAt: now,
+    updatedAt: now,
+    expiresAt: Date.now() + ACTIVE_TASK_TTL_MS,
+  };
+  return appendActiveTaskPrompt(task, prompt);
+}
+
+function saveCalendarTaskFromHistory(userId: string, promptHistory: string[]) {
+  const now = nowIso();
+  const task: ActiveTask = {
+    id: makeId("task"),
+    userId,
+    intentId: CALENDAR_SCHEDULE_INTENT_ID,
+    promptHistory: promptHistory.map((prompt) => prompt.trim()).filter(Boolean).slice(-ACTIVE_TASK_HISTORY_LIMIT),
+    selectedTools: [...CALENDAR_SCHEDULE_SLUGS],
+    rationale: "calendar.schedule reconstructed from conversation history",
+    createdAt: now,
+    updatedAt: now,
+    expiresAt: Date.now() + ACTIVE_TASK_TTL_MS,
+  };
+  activeTasks.set(activeTaskKey(userId, CALENDAR_SCHEDULE_INTENT_ID), task);
+  return task;
+}
+
+function activeTaskRoute(task: ActiveTask): RouteToolsResult {
+  return {
+    slugs: task.selectedTools,
+    rationale: `${task.rationale}; active task follow-up`,
+    intentIds: [task.intentId],
+    confidence: 1,
+    routingMode: "deterministic",
+  };
+}
+
+function activeTaskPrompt(task: ActiveTask) {
+  return task.promptHistory.join("\n");
+}
+
+function latestAssistantSuggestsCalendarFollowup(
+  messages: CoreMessage[],
+  task?: Pick<ActiveTask, "promptHistory">
+) {
+  const text = latestAssistantText(messages);
+  const asksForDetails =
+    /\b(?:email|date|time|duration|title|details|provide|need|what|which|when|how long)\b/i.test(text);
+  if (!asksForDetails) {
+    return false;
+  }
+  if (/\b(?:schedule|calendar|event|meeting|invite)\b/i.test(text)) {
+    return true;
+  }
+  return task ? assistantReferencesCalendarTask(text, task) : false;
+}
+
+function assistantReferencesCalendarTask(text: string, task: Pick<ActiveTask, "promptHistory">) {
+  const normalized = text.toLowerCase();
+  return calendarTaskReferenceTokens(task).some((token) => normalized.includes(token));
+}
+
+function calendarTaskReferenceTokens(task: Pick<ActiveTask, "promptHistory">) {
+  const source = task.promptHistory
+    .join("\n")
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, " ");
+  const tokens = new Set<string>();
+
+  for (const match of source.matchAll(/\b[A-Z][a-z][A-Za-z.'-]{1,}\b/g)) {
+    addCalendarReferenceToken(tokens, match[0]);
+  }
+  for (const match of source.matchAll(/\b(?:with|invite|for)\s+([a-z][a-z.'-]{2,})\b/gi)) {
+    addCalendarReferenceToken(tokens, match[1]);
+  }
+
+  return [...tokens];
+}
+
+function addCalendarReferenceToken(tokens: Set<string>, value: string) {
+  const token = value.toLowerCase().replace(/'s$/, "");
+  if (
+    token.length < 3 ||
+    /^(schedule|calendar|event|meeting|invite|call|today|tomorrow|next|title|duration|with|for|the|and|test|tests|january|february|march|april|june|july|august|september|october|november|december)$/i.test(
+      token
+    )
+  ) {
+    return;
+  }
+  tokens.add(token);
+}
+
+function isLikelyCalendarFollowup(prompt: string) {
+  const text = prompt.trim();
+  if (!text || text.length > 500) {
+    return false;
+  }
+  return (
+    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(text) ||
+    /^(?:yes|yep|yeah|ok|okay|sure|the\s+)?(?:first|second|third|1st|2nd|3rd)(?:\s+one)?$/i.test(text) ||
+    /^(?:yes|yep|yeah|ok|okay|sure|that one|this one|the one)$/i.test(text) ||
+    /\b(?:primary|work calendar|personal calendar)\b/i.test(text) ||
+    /\b(?:today|tomorrow|next|monday|tuesday|wednesday|thursday|friday|saturday|sunday|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(text) ||
+    /\b20\d{2}-\d{1,2}-\d{1,2}\b/.test(text) ||
+    /\b(?:1[0-2]|0?[1-9])(?::[0-5]\d)?\s*(?:am|pm)\b/i.test(text) ||
+    /\b(?:[01]?\d|2[0-3]):[0-5]\d\b/.test(text) ||
+    /\b\d+(?:\.\d+)?\s*-?\s*(?:hours?|hrs?|hr|h|minutes?|mins?|min|m)\b/i.test(text) ||
+    /\b(?:title|titled|called|named|duration|email)\b/i.test(text) ||
+    (text.length <= 160 && text.includes(","))
+  );
+}
+
+function looksLikeNewNonCalendarIntent(prompt: string) {
+  return (
+    !isCalendarScheduleAnchor(prompt) &&
+    (/\b(?:send|reply|forward|draft|write|github|issue|issues|sheet|spreadsheet|drive|resume|resumes)\b/i.test(
+      prompt
+    ) ||
+      /\b(?:email|mail)\s+(?:it|this|that|them|him|her|to)\b/i.test(prompt))
+  );
+}
+
+function isCalendarScheduleAnchor(prompt: string) {
+  return (
+    /\b(?:schedule|book|create|set up|setup|add|put|make)\b/i.test(prompt) &&
+    /\b(?:calendar|event|meeting|invite|call|with)\b/i.test(prompt)
+  );
+}
+
+function reconstructCalendarTaskHistory(messages: CoreMessage[]) {
+  const userTexts = messages
+    .filter((message) => message.role === "user")
+    .map(messageText)
+    .map((text) => text.trim())
+    .filter(Boolean);
+
+  for (let i = userTexts.length - 1; i >= 0; i -= 1) {
+    if (isCalendarScheduleAnchor(userTexts[i])) {
+      return userTexts.slice(i).slice(-ACTIVE_TASK_HISTORY_LIMIT);
+    }
+  }
+  return null;
+}
+
+function activeCalendarTaskForFollowup(userId: string, messages: CoreMessage[], prompt: string) {
+  if (isCalendarScheduleAnchor(prompt)) {
+    return null;
+  }
+  if (looksLikeNewNonCalendarIntent(prompt)) {
+    return null;
+  }
+  if (!isLikelyCalendarFollowup(prompt)) {
+    return null;
+  }
+
+  const existing = getActiveTask(userId, CALENDAR_SCHEDULE_INTENT_ID);
+  if (existing) {
+    if (!latestAssistantSuggestsCalendarFollowup(messages, existing)) {
+      return null;
+    }
+    return appendActiveTaskPrompt(existing, prompt);
+  }
+
+  const history = reconstructCalendarTaskHistory(messages);
+  if (!history || history.length === 0) {
+    return null;
+  }
+  const reconstructed = { promptHistory: history };
+  if (!latestAssistantSuggestsCalendarFollowup(messages, reconstructed)) {
+    return null;
+  }
+  return saveCalendarTaskFromHistory(userId, history);
 }
 
 // If the previous turn asked the user for a workflow source (repo / Drive folder)
@@ -1548,7 +1846,13 @@ Bun.serve({
         const resumed = await maybeResumeWorkflowFromFollowup(messages, prompt, userId);
         if (resumed) return resumed;
 
-        const route = await routeToolsForPrompt(prompt);
+        const activeCalendarTask = activeCalendarTaskForFollowup(userId, messages, prompt);
+        const route = activeCalendarTask ? activeTaskRoute(activeCalendarTask) : await routeToolsForPrompt(prompt);
+        let calendarTask = activeCalendarTask;
+        if (!calendarTask && routeIsCalendarSchedule(route)) {
+          calendarTask = saveCalendarTask(userId, prompt, route);
+        }
+
         const requiredToolkits = requiredToolkitsForSlugs(route.slugs);
         if (requiredToolkits.length) {
           const connections = await getConnectionStatuses(userId);
@@ -1591,6 +1895,19 @@ Bun.serve({
           return startWorkflowResponse(workflow, userId, prompt, route.slugs, route.rationale, extraInput);
         }
 
+        if (routeIsCalendarSchedule(route)) {
+          const task = calendarTask ?? saveCalendarTask(userId, prompt, route);
+          const combinedPrompt = activeTaskPrompt(task);
+          const draft = parseCalendarEventDraft(combinedPrompt, {
+            now: new Date(),
+            timeZone: DEFAULT_CALENDAR_TIMEZONE,
+          });
+          if (draft) {
+            clearActiveTask(userId, CALENDAR_SCHEDULE_INTENT_ID);
+            return calendarDraftResponse(userId, combinedPrompt, route, draft);
+          }
+        }
+
         const toolSchemas = await loadToolSchemas(route.slugs);
         if (route.slugs.length > 0 && toolSchemas.length === 0) {
           const run = createRun(userId, prompt, route.slugs, "tool schema load failed");
@@ -1623,6 +1940,8 @@ Bun.serve({
         const attachedNames = files.map((file) => file.filename).join(", ");
         const filesNote = files.length
           ? `\n\nIMPORTANT — attachments: The user has ALREADY uploaded ${files.length} file(s) for this request: ${attachedNames}. The file(s) are present now and will be attached automatically by the system when you call the send-email tool. Do NOT ask the user to upload, re-upload, share, or provide the file again, and do not say you cannot see it — it is already here. Do NOT set or guess the attachment field yourself (you do not have the file's storage key); just call the send-email tool with the recipient/subject/body and the system attaches the file.`
+          : route.intentIds?.includes("email.send_with_upload")
+            ? `\n\nIMPORTANT — attachments: The user is asking about an attached/uploaded PDF, but no file is attached in this chat turn. Ask them to upload the PDF using the app's PDF button and provide any missing email details. Do NOT ask for file paths, storage keys, S3 keys, upload keys, or internal file references. Do NOT call the send-email tool until a file is attached and the recipient/message details are available.`
           : "";
 
         // Also reinforce the attachment fact inside the conversation (see helper).

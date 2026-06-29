@@ -79,7 +79,8 @@ zip -r "$ZIP_FILE" . \
 	-x "*.tsbuildinfo" \
 	-x "dist/*" \
 	-x ".DS_Store" \
-	-x ".env*" \
+	-x ".env" \
+	-x ".env.local" \
 	-x "*.log" \
 	-x "coverage/*" \
 	-x "*.pem" \
