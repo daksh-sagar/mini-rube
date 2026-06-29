@@ -95,6 +95,7 @@ type GithubIssueCollectionOptions = {
   limit?: number;
   sort: "created" | "updated";
   direction: "asc" | "desc";
+  state: "all" | "open" | "closed";
 };
 
 export const GITHUB_ISSUES_TO_SHEET: WorkflowDefinition = {
@@ -418,8 +419,9 @@ async function runDriveResumesToSheet(
   const job = await prepareJob(runtime, DRIVE_RESUMES_TO_SHEET.id, input);
   try {
     const folderId = await resolveDriveFolderId(runtime, input, job.id);
+    const limit = explicitResumeLimit(input);
     await updateProgress(runtime, job.id, { phase: "listing", totalItems: 0 });
-    const files = await collectDriveFiles(runtime, job, folderId);
+    const files = await collectDriveFiles(runtime, job, folderId, limit);
     const rows = await parseResumeFiles(runtime, job, files);
 
     await assertNotCancelled(runtime, job.id, {
@@ -493,7 +495,7 @@ async function collectGithubIssues(
     const result = await executeWithRetry(runtime, "GITHUB_LIST_REPOSITORY_ISSUES", {
       owner,
       repo,
-      state: "all",
+      state: options.state,
       per_page: pageSize,
       page,
       direction: options.direction,
@@ -549,11 +551,15 @@ function githubIssueCollectionOptions(input: WorkflowRunInput): GithubIssueColle
   const lower = prompt.toLowerCase();
   const wantsOldest = /\b(oldest|earliest|first)\b/.test(lower);
   const wantsUpdated = /\b(updated|modified|changed|active|recently updated)\b/.test(lower);
+  const wantsOpenAndClosed = /\b(open\s+(?:and|&)\s+closed|closed\s+(?:and|&)\s+open|open\/closed|all\s+issues?)\b/.test(lower);
+  const wantsClosed = !wantsOpenAndClosed && /\b(closed|resolved)\b/.test(lower);
+  const wantsOpen = !wantsOpenAndClosed && !wantsClosed && /\b(open|unresolved)\b/.test(lower);
 
   return {
     limit: explicitLimit,
     sort: wantsUpdated ? "updated" : "created",
     direction: explicitLimit ? (wantsOldest ? "asc" : "desc") : "asc",
+    state: wantsClosed ? "closed" : wantsOpen ? "open" : "all",
   };
 }
 
@@ -571,10 +577,43 @@ function explicitGithubIssueLimit(input: WorkflowRunInput): number | undefined {
   }
 
   const patterns = [
-    /\b(?:last|latest|recent|newest|top|first|oldest|earliest)\s+(\d{1,4})\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
-    /\b(\d{1,4})\s+(?:recent|latest|newest|last|oldest|earliest|top)\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
-    /\b(?:fetch|get|list|read|show|write|export|summari[sz]e|make|create)\s+(?:the\s+)?(?:last|latest|recent|newest|oldest|earliest|top|first\s+)?(\d{1,4})\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
-    /\b(\d{1,4})\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+    /\b(?:last|latest|recent|newest|top|first|oldest|earliest)\s+(\d{1,4})\s+(?:open\s+|closed\s+|resolved\s+|unresolved\s+)?(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+    /\b(\d{1,4})\s+(?:recent|latest|newest|last|oldest|earliest|top)\s+(?:open\s+|closed\s+|resolved\s+|unresolved\s+)?(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+    /\b(?:fetch|get|list|read|show|write|export|summari[sz]e|make|create)\s+(?:the\s+)?(?:last|latest|recent|newest|oldest|earliest|top|first\s+)?(\d{1,4})\s+(?:recent\s+|latest\s+|newest\s+|open\s+|closed\s+|resolved\s+|unresolved\s+)*(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+    /\b(\d{1,4})\s+(?:open\s+|closed\s+|resolved\s+|unresolved\s+)?(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = prompt.match(pattern);
+    if (match) {
+      const limit = positiveInteger(match[1], 0);
+      if (limit > 0) {
+        return limit;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function explicitResumeLimit(input: WorkflowRunInput): number | undefined {
+  for (const key of ["limit", "maxItems", "max_items", "maxFiles", "max_files", "resumeLimit", "resume_limit"]) {
+    const value = positiveInteger(input[key], 0);
+    if (value > 0) {
+      return value;
+    }
+  }
+
+  const prompt = String(input.prompt ?? "").toLowerCase();
+  if (!prompt) {
+    return undefined;
+  }
+
+  const patterns = [
+    /\b(?:first|last|latest|recent|newest|oldest|top)\s+(\d{1,4})\s+(?:resume|resumes|candidate\s+documents?|pdfs?|files?)\b/,
+    /\b(\d{1,4})\s+(?:recent|latest|newest|last|oldest|first|top)\s+(?:resume|resumes|candidate\s+documents?|pdfs?|files?)\b/,
+    /\b(?:take|parse|extract|process|read|list|write|export|make|create)\s+(?:the\s+)?(?:first|last|latest|recent|newest|oldest|top\s+)?(\d{1,4})\s+(?:resume|resumes|candidate\s+documents?|pdfs?|files?)\b/,
+    /\b(\d{1,4})\s+(?:resume|resumes|candidate\s+documents?|pdfs?)\b/,
   ];
 
   for (const pattern of patterns) {
@@ -616,14 +655,20 @@ const DRIVE_LIST_STRATEGIES: DriveListStrategy[] = [
   },
 ];
 
-async function collectDriveFiles(runtime: WorkflowRuntime, job: WorkflowJob, folderId: string) {
+async function collectDriveFiles(
+  runtime: WorkflowRuntime,
+  job: WorkflowJob,
+  folderId: string,
+  limit?: number
+) {
   let lastError: unknown;
 
   for (const strategy of DRIVE_LIST_STRATEGIES) {
     try {
-      const rawFiles = await listFolderFiles(runtime, job, folderId, strategy);
+      const rawFiles = await listFolderFiles(runtime, job, folderId, strategy, limit);
       if (rawFiles.length > 0) {
-        return rawFiles.filter(isResumeLikeFile);
+        const resumes = rawFiles.filter(isResumeLikeFile);
+        return limit ? resumes.slice(0, limit) : resumes;
       }
     } catch (err) {
       lastError = err;
@@ -645,10 +690,13 @@ async function listFolderFiles(
   runtime: WorkflowRuntime,
   job: WorkflowJob,
   folderId: string,
-  strategy: DriveListStrategy
+  strategy: DriveListStrategy,
+  limit?: number
 ) {
   const files = new Map<string, Record<string, unknown>>();
   let pageToken: string | undefined;
+  let resumeCount = 0;
+  const pageSize = limit ? Math.min(runtime.pageSize, limit) : runtime.pageSize;
 
   do {
     await assertNotCancelled(runtime, job.id, {
@@ -658,7 +706,7 @@ async function listFolderFiles(
     const result = await executeWithRetry(
       runtime,
       strategy.slug,
-      strategy.buildArgs(folderId, pageToken, runtime.pageSize),
+      strategy.buildArgs(folderId, pageToken, pageSize),
       context(job)
     );
     const items = findCollection(result, ["files", "items", "children", "results"]);
@@ -667,11 +715,18 @@ async function listFolderFiles(
       if (!id) {
         continue;
       }
+      const alreadySeen = files.has(id);
       files.set(id, {
         ...item,
         id,
         fileId: firstString(item, ["fileId", "file_id"]) ?? id,
       });
+      if (!alreadySeen && isResumeLikeFile(item)) {
+        resumeCount += 1;
+      }
+      if (limit && resumeCount >= limit) {
+        break;
+      }
     }
 
     pageToken = nextToken(result);
@@ -685,7 +740,7 @@ async function listFolderFiles(
       fetchedItems: files.size,
       totalItems: bestTotal(result, files.size),
     });
-  } while (pageToken);
+  } while (pageToken && (!limit || resumeCount < limit));
 
   return [...files.values()];
 }

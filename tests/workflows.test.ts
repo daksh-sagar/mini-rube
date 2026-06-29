@@ -119,8 +119,50 @@ describe("planned workflow execution", () => {
     expect(listCalls).toHaveLength(1);
     expect(listCalls[0].args).toMatchObject({
       per_page: 5,
+      state: "all",
       direction: "desc",
       sort: "created",
+    });
+  });
+
+  test("preserves explicit GitHub issue state filters when writing a sheet", async () => {
+    const issues = makeIssues(40);
+    const writtenRows: Array<Record<string, unknown>> = [];
+    const listCalls: ToolCall[] = [];
+    const service = await makeWorkflowService({
+      onToolCall: async (slug, args, context) => {
+        if (slug === "GITHUB_LIST_REPOSITORY_ISSUES") {
+          listCalls.push({ slug, args, context });
+          const filtered = issues.filter((issue) => issue.state === args.state);
+          const ordered = String(args.direction) === "desc" ? [...filtered].reverse() : filtered;
+          return pageResult(ordered, args, "issues");
+        }
+
+        if (isSheetWrite(slug)) {
+          writtenRows.push(...rowsFromArgs(args));
+          return sheetWriteResult(writtenRows.length);
+        }
+
+        throw new Error(`Unexpected tool call: ${slug}`);
+      },
+    });
+
+    const result = await service.runWorkflow(GITHUB_ISSUES_TO_SHEET, {
+      userId: "user_open_issues",
+      repository: "composiohq/composio",
+      prompt: "fetch 5 recent open github issues on composiohq/composio and write them to a sheet",
+    });
+
+    expect(result).toMatchObject({
+      status: "completed",
+      writtenRows: 5,
+    });
+    expect(writtenRows).toHaveLength(5);
+    expect(writtenRows.every((row) => row.state === "open")).toBe(true);
+    expect(listCalls[0].args).toMatchObject({
+      per_page: 5,
+      state: "open",
+      direction: "desc",
     });
   });
 
@@ -180,6 +222,54 @@ describe("planned workflow execution", () => {
     expect(writtenRows).toHaveLength(1000);
     expect(rowsWithParseErrors(writtenRows)).toHaveLength(parseFailureIds.size);
     expect(new Set(writtenRows.map((row) => row.fileId ?? row.id ?? row.sourceId)).size).toBe(1000);
+  });
+
+  test("respects an explicit Drive resume count when writing a sheet", async () => {
+    const resumes = makeResumeFiles(20);
+    const writtenRows: Array<Record<string, unknown>> = [];
+    const listCalls: ToolCall[] = [];
+    const service = await makeWorkflowService({
+      onToolCall: async (slug, args, context) => {
+        if (slug === "GOOGLESUPER_FIND_FILE" || slug === "GOOGLESUPER_LIST_CHILDREN_V2") {
+          listCalls.push({ slug, args, context });
+          return pageResult(resumes, args, "files");
+        }
+
+        if (slug === "GOOGLESUPER_PARSE_FILE") {
+          const fileId = stringArg(args, ["fileId", "file_id", "id"]);
+          const index = Number(fileId.split("_").at(-1));
+          return {
+            text: `Candidate ${index}`,
+            candidate: {
+              name: `Candidate ${index}`,
+              university: `University ${index}`,
+              lastJob: `Company ${index}`,
+            },
+          };
+        }
+
+        if (isSheetWrite(slug)) {
+          writtenRows.push(...rowsFromArgs(args));
+          return sheetWriteResult(writtenRows.length);
+        }
+
+        throw new Error(`Unexpected tool call: ${slug}`);
+      },
+    });
+
+    const result = await service.runWorkflow(DRIVE_RESUMES_TO_SHEET, {
+      userId: "user_limited_resumes",
+      folderId: "drive_folder_limited",
+      prompt: "take the first 3 resumes in this Drive folder and make a Google Sheet",
+    });
+
+    expect(result).toMatchObject({
+      status: "completed",
+      writtenRows: 3,
+    });
+    expect(writtenRows.map((row) => row.fileId)).toEqual(["resume_1", "resume_2", "resume_3"]);
+    expect(listCalls).toHaveLength(1);
+    expect(listCalls[0].args).toMatchObject({ pageSize: 3 });
   });
 
   test("parses Drive resumes with bounded concurrency and preserves sheet row order", async () => {
