@@ -54,7 +54,7 @@ GITHUB_AUTH_CONFIG_ID=...
 ```
 
 You usually do not need to set anything else. The app has defaults for models,
-token limits, workflow page sizes, and concurrency.
+token limits, tool selection, workflow page sizes, and concurrency.
 
 ### 4. Run the app
 
@@ -109,6 +109,21 @@ Optional settings you can override:
   extraction. Default: enabled.
 - `WORKFLOW_DB_PATH`: local SQLite path for workflow job metadata. Default:
   `.mini-rube/workflows.sqlite`.
+- `PORT`: Bun server port. Default: `3001`.
+- `BUN_IDLE_TIMEOUT`: Bun server idle timeout in seconds. Default: `120`.
+
+Advanced routing/debug settings:
+
+- `CHAT_TOOL_SELECTION_MODE`: which tool schemas are exposed to the chat model.
+  Default: `all_connected`, which exposes every supported tool for connected
+  accounts while still using the router for workflow, safety, and mutation
+  gating. Set to `routed` to roll back to only the routed tool bundle.
+- `TOOL_ROUTER_STRATEGY`: first-layer router strategy. Valid values:
+  `llm_first`, `deterministic`, or `shadow`. Default: `llm_first`.
+- `TOOL_ROUTER_DISCOVERY`: set to `0` to disable live-catalog discovery in the
+  deterministic router path.
+- `TOOL_ROUTER_USE_LLM`: set to `0` to force deterministic routing; set to `1`
+  to enable LLM refinement when using the deterministic/discovery path.
 
 ## How It Works
 
@@ -133,14 +148,19 @@ In production, the Bun server also serves the built frontend from
 4. After OAuth finishes, the frontend checks connection status through
    `GET /api/connections`.
 5. When you send a chat message, the frontend calls `POST /api/chat`.
-6. The backend routes the prompt to useful Composio tools, calls the model through
+6. The backend routes the prompt to understand the current task, loads the
+   supported tools for the user's connected accounts, calls the model through
    OpenRouter, and streams the response back to the UI.
 
 ## Tool Routing
 
-The app does not expose every tool blindly to the model.
+The app does not expose every Composio tool blindly to the model.
 
-For common tasks, it first uses a deterministic intent registry:
+The tool surface is first filtered to the Mini Rube product surface: Gmail,
+Calendar, Contacts, Drive, Sheets, and GitHub issues. Unsupported tools from the
+same Composio toolkits are not exposed.
+
+For common tasks, the app uses an intent registry:
 
 - read Gmail
 - send Gmail
@@ -149,15 +169,26 @@ For common tasks, it first uses a deterministic intent registry:
 - summarize GitHub issues
 - process Drive folders of resumes
 
-If the prompt is less obvious, the router falls back to discovery over the live
-Composio tool catalog. This keeps known tasks reliable while still allowing new
-phrasing to work.
+For normal chat turns, the model gets all supported tools for accounts that are
+currently connected. The router is still used as a control layer: it decides
+whether the request is a workflow, whether a missing connection should block the
+turn, what task context is active, and which mutating tools are authorized.
+
+That last part is important: a read-only prompt may have sheet-writing tools
+available in the model's schema list, but the server will block mutating tool
+calls unless the latest routed request explicitly allows that exact write.
+
+If the prompt is less obvious, the router can fall back to discovery over the
+live Composio tool catalog. This keeps known tasks reliable while still allowing
+new phrasing to work.
 
 The main files are:
 
 - `src/lib/intent-registry.ts`: known intents and their preferred tools.
 - `src/lib/router.ts`: prompt-to-tool routing.
 - `src/lib/tool-catalog.ts`: loads and filters Composio tool schemas.
+- `src/lib/tool-selection.ts`: decides which connected tools chat can see and
+  which routed mutations are allowed.
 - `src/lib/tools.ts`: executes selected Composio tools.
 
 ## Confirmations And Safety
@@ -235,6 +266,40 @@ Because much of the state is process-local, restarting the server can clear
 active chat runs, pending confirmations, and uploaded file references. Connected
 Google/GitHub accounts live in Composio and survive server restarts.
 
+If an account is disconnected mid-chat, the next chat turn checks connection
+state again. Tools for that disconnected account are not exposed, and a request
+that needs the account asks the user to reconnect before running anything.
+
+## Deployment
+
+The repo includes a Dockerfile that builds the Vite frontend and runs the Bun
+server in production mode. A deployed service needs the same required environment
+variables as local development:
+
+```sh
+COMPOSIO_API_KEY=...
+OPENROUTER_API_KEY=...
+GOOGLESUPER_AUTH_CONFIG_ID=...
+GITHUB_AUTH_CONFIG_ID=...
+```
+
+On Render, this app is deployed as a web service from this repository. Useful
+commands:
+
+```sh
+render deploys create <service-id> --commit <commit-sha> --wait
+render logs --resources <service-id> --tail
+```
+
+The app exposes a lightweight health check:
+
+```txt
+/healthz
+```
+
+Free hosting plans can sleep when idle. A cron ping can hit `/healthz`, but this
+does not replace proper error handling for long-running workflows.
+
 ## Troubleshooting
 
 ### The app says a Google or GitHub connection is missing
@@ -269,6 +334,16 @@ JSON_MAX_TOKENS=2048
 ```
 
 Most local runs should not need this.
+
+### The agent picks stale tools from the previous task
+
+The current default exposes all supported tools for connected accounts while the
+latest prompt controls task context and mutation authorization. If you need to
+debug or roll back to the older narrower behavior, set:
+
+```sh
+CHAT_TOOL_SELECTION_MODE=routed
+```
 
 ### The frontend opens but API calls fail
 
