@@ -67,10 +67,7 @@ const workflowService = createWorkflowService({
   defaults: {
     sheetBatchSize: Number(process.env.WORKFLOW_SHEET_BATCH_SIZE ?? 100),
     pageSize: Number(process.env.WORKFLOW_PAGE_SIZE ?? 100),
-    // PDF text extraction runs in-process and is memory-heavy on small Render
-    // instances. Keep the production default sequential; override with
-    // WORKFLOW_CONCURRENCY when the host has enough headroom.
-    workflowConcurrency: Number(process.env.WORKFLOW_CONCURRENCY ?? 1),
+    workflowConcurrency: Number(process.env.WORKFLOW_CONCURRENCY ?? 8),
     sheetValueMode: "googleValues",
     workerId: `server_${process.pid}`,
     // The resume prompt explicitly asks for name/university/last-job, which

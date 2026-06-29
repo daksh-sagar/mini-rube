@@ -322,7 +322,7 @@ describe("planned workflow execution", () => {
     expect(writtenRows.map((row) => row.fileId)).toEqual(resumes.map((resume) => resume.fileId));
   });
 
-  test("defaults Drive resume parsing to sequential work", async () => {
+  test("defaults Drive resume parsing to concurrent work", async () => {
     const resumes = makeResumeFiles(5);
     let activeParses = 0;
     let maxActiveParses = 0;
@@ -356,7 +356,8 @@ describe("planned workflow execution", () => {
     });
 
     expect(result.status).toBe("completed");
-    expect(maxActiveParses).toBe(1);
+    expect(maxActiveParses).toBeGreaterThan(1);
+    expect(maxActiveParses).toBeLessThanOrEqual(resumes.length);
   });
 
   test("cancels Drive resume workflow before sheet writes", async () => {
