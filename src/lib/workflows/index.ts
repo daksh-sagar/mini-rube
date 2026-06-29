@@ -91,6 +91,12 @@ type SheetWriteResult = {
   artifacts: WorkflowArtifact[];
 };
 
+type GithubIssueCollectionOptions = {
+  limit?: number;
+  sort: "created" | "updated";
+  direction: "asc" | "desc";
+};
+
 export const GITHUB_ISSUES_TO_SHEET: WorkflowDefinition = {
   id: "github.issues_to_sheet",
   label: "GitHub issues to Google Sheet",
@@ -365,8 +371,9 @@ async function runGithubIssuesToSheet(
   const job = await prepareJob(runtime, GITHUB_ISSUES_TO_SHEET.id, input);
   try {
     const repo = parseGithubRepository(input);
+    const collectionOptions = githubIssueCollectionOptions(input);
     await updateProgress(runtime, job.id, { phase: "fetching", totalItems: 0 });
-    const issues = await collectGithubIssues(runtime, job, repo.owner, repo.repo);
+    const issues = await collectGithubIssues(runtime, job, repo.owner, repo.repo, collectionOptions);
     const rows = issues.map((issue) => githubIssueToRow(issue));
     await updateProgress(runtime, job.id, {
       phase: "approval",
@@ -467,10 +474,16 @@ async function prepareJob(runtime: WorkflowRuntime, workflowId: string, input: W
   );
 }
 
-async function collectGithubIssues(runtime: WorkflowRuntime, job: WorkflowJob, owner: string, repo: string) {
+async function collectGithubIssues(
+  runtime: WorkflowRuntime,
+  job: WorkflowJob,
+  owner: string,
+  repo: string,
+  options: GithubIssueCollectionOptions
+) {
   const byNumber = new Map<number, Record<string, unknown>>();
   let page = 1;
-  let pageSize = runtime.pageSize;
+  const pageSize = options.limit ? Math.min(runtime.pageSize, options.limit) : runtime.pageSize;
 
   while (true) {
     await assertNotCancelled(runtime, job.id, {
@@ -483,8 +496,8 @@ async function collectGithubIssues(runtime: WorkflowRuntime, job: WorkflowJob, o
       state: "all",
       per_page: pageSize,
       page,
-      direction: "asc",
-      sort: "created",
+      direction: options.direction,
+      sort: options.sort,
     }, context(job));
     const items = findCollection(result, ["issues", "items", "results"]);
     for (const item of items) {
@@ -494,6 +507,9 @@ async function collectGithubIssues(runtime: WorkflowRuntime, job: WorkflowJob, o
       const number = toNumber(item.number);
       if (number !== undefined) {
         byNumber.set(number, item);
+      }
+      if (options.limit && byNumber.size >= options.limit) {
+        break;
       }
     }
 
@@ -506,16 +522,72 @@ async function collectGithubIssues(runtime: WorkflowRuntime, job: WorkflowJob, o
       phase: "fetching",
       fetchedItems: byNumber.size,
       processedItems: byNumber.size,
-      totalItems: bestTotal(result, byNumber.size),
+      totalItems: options.limit
+        ? Math.min(options.limit, bestTotal(result, byNumber.size))
+        : bestTotal(result, byNumber.size),
     });
 
+    if (options.limit && byNumber.size >= options.limit) {
+      break;
+    }
     if (!hasNextPage(result, items.length, pageSize, page)) {
       break;
     }
     page += 1;
   }
 
-  return [...byNumber.values()].sort((a, b) => (toNumber(a.number) ?? 0) - (toNumber(b.number) ?? 0));
+  const issues = [...byNumber.values()];
+  if (options.limit) {
+    return issues.slice(0, options.limit);
+  }
+  return issues.sort((a, b) => (toNumber(a.number) ?? 0) - (toNumber(b.number) ?? 0));
+}
+
+function githubIssueCollectionOptions(input: WorkflowRunInput): GithubIssueCollectionOptions {
+  const prompt = String(input.prompt ?? "");
+  const explicitLimit = explicitGithubIssueLimit(input);
+  const lower = prompt.toLowerCase();
+  const wantsOldest = /\b(oldest|earliest|first)\b/.test(lower);
+  const wantsUpdated = /\b(updated|modified|changed|active|recently updated)\b/.test(lower);
+
+  return {
+    limit: explicitLimit,
+    sort: wantsUpdated ? "updated" : "created",
+    direction: explicitLimit ? (wantsOldest ? "asc" : "desc") : "asc",
+  };
+}
+
+function explicitGithubIssueLimit(input: WorkflowRunInput): number | undefined {
+  for (const key of ["limit", "maxItems", "max_items", "maxIssues", "max_issues", "issueLimit", "issue_limit"]) {
+    const value = positiveInteger(input[key], 0);
+    if (value > 0) {
+      return value;
+    }
+  }
+
+  const prompt = String(input.prompt ?? "").toLowerCase();
+  if (!prompt) {
+    return undefined;
+  }
+
+  const patterns = [
+    /\b(?:last|latest|recent|newest|top|first|oldest|earliest)\s+(\d{1,4})\b/,
+    /\b(\d{1,4})\s+(?:recent|latest|newest|last|oldest|earliest|top)\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+    /\b(?:fetch|get|list|read|show|write|export|summari[sz]e|make|create)\s+(?:the\s+)?(?:last|latest|recent|newest|oldest|earliest|top|first\s+)?(\d{1,4})\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+    /\b(\d{1,4})\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = prompt.match(pattern);
+    if (match) {
+      const limit = positiveInteger(match[1], 0);
+      if (limit > 0) {
+        return limit;
+      }
+    }
+  }
+
+  return undefined;
 }
 
 type DriveListStrategy = {

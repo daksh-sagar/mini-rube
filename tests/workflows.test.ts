@@ -83,6 +83,47 @@ describe("planned workflow execution", () => {
     expect(toolCalls.filter((call) => isSheetWrite(call.slug)).length).toBeGreaterThan(0);
   });
 
+  test("respects an explicit recent GitHub issue count when writing a sheet", async () => {
+    const issues = makeIssues(50);
+    const writtenRows: Array<Record<string, unknown>> = [];
+    const listCalls: ToolCall[] = [];
+    const service = await makeWorkflowService({
+      onToolCall: async (slug, args, context) => {
+        if (slug === "GITHUB_LIST_REPOSITORY_ISSUES") {
+          listCalls.push({ slug, args, context });
+          const ordered = String(args.direction) === "desc" ? [...issues].reverse() : issues;
+          return pageResult(ordered, args, "issues");
+        }
+
+        if (isSheetWrite(slug)) {
+          writtenRows.push(...rowsFromArgs(args));
+          return sheetWriteResult(writtenRows.length);
+        }
+
+        throw new Error(`Unexpected tool call: ${slug}`);
+      },
+    });
+
+    const result = await service.runWorkflow(GITHUB_ISSUES_TO_SHEET, {
+      userId: "user_recent_issues",
+      repository: "composiohq/composio",
+      prompt: "fetch 5 recent github issues on composiohq/composio and write them to a sheet",
+    });
+
+    expect(result).toMatchObject({
+      status: "completed",
+      writtenRows: 5,
+    });
+    expect(writtenRows).toHaveLength(5);
+    expect(writtenRows.map((row) => row.issueNumber)).toEqual([50, 49, 48, 47, 46]);
+    expect(listCalls).toHaveLength(1);
+    expect(listCalls[0].args).toMatchObject({
+      per_page: 5,
+      direction: "desc",
+      sort: "created",
+    });
+  });
+
   test("writes 1000 resume rows and includes parse failures as rows", async () => {
     const resumes = makeResumeFiles(1000);
     const parseFailureIds = new Set(["resume_17", "resume_250", "resume_999"]);
