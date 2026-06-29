@@ -44,7 +44,11 @@ export const TOOLKIT_AUTH_REQUIREMENTS: Record<SupportedToolkit, ToolkitAccessRe
     {
       label: "Sheets",
       reason: "Create and append rows to generated reports after confirmation.",
-      tools: ["GOOGLESUPER_SHEET_FROM_JSON", "GOOGLESUPER_SPREADSHEETS_VALUES_APPEND"],
+      tools: [
+        "GOOGLESUPER_SHEET_FROM_JSON",
+        "GOOGLESUPER_SPREADSHEETS_VALUES_APPEND",
+        "GOOGLESUPER_GET_BATCH_VALUES",
+      ],
     },
   ],
   github: [

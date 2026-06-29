@@ -141,6 +141,10 @@ function getString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+function isTrueHeader(value: string | null) {
+  return value?.trim().toLowerCase() === "true";
+}
+
 function getNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value !== "string" || !value.trim()) return null;
@@ -795,6 +799,8 @@ export default function App() {
   const [confirmingAction, setConfirmingAction] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [chatError, setChatError] = useState<string | null>(null);
+  const messageCountRef = useRef(0);
+  const jobMessageScanStartRef = useRef(0);
   const chatRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Stick to the bottom only when the user is already there, so streaming tokens
@@ -822,7 +828,13 @@ export default function App() {
           getString(response.headers.get("x-job-id")) ??
           getString(response.headers.get("x-mini-rube-job-id")) ??
           getString(response.headers.get("x-rube-job-id"));
-        if (responseJobId) setJobId(responseJobId);
+        if (responseJobId) {
+          jobMessageScanStartRef.current = messageCountRef.current;
+          setJobId(responseJobId);
+        } else if (isTrueHeader(response.headers.get("x-mini-rube-clear-active-job"))) {
+          jobMessageScanStartRef.current = messageCountRef.current;
+          clearSelectedJob();
+        }
       },
       onError(err) {
         setChatError(err.message || "The chat request failed.");
@@ -902,7 +914,12 @@ export default function App() {
   }, [messages, runId]);
 
   useEffect(() => {
-    const latestJobId = [...messages]
+    messageCountRef.current = messages.length;
+  }, [messages.length]);
+
+  useEffect(() => {
+    const latestJobId = messages
+      .slice(jobMessageScanStartRef.current)
       .reverse()
       .filter((message) => message.role === "assistant")
       .map((message) => extractJobIdFromText(message.content))
@@ -1438,6 +1455,8 @@ export default function App() {
 
   function resetChatState() {
     stop();
+    messageCountRef.current = 0;
+    jobMessageScanStartRef.current = 0;
     setMessages([]);
     setRunId(null);
     setRunTrace(null);
@@ -1454,6 +1473,16 @@ export default function App() {
     setChatError(null);
     setPendingActionStore({});
     setConfirmedActions(new Set());
+  }
+
+  function clearSelectedJob() {
+    setJobId(null);
+    setJob(null);
+    setJobState("idle");
+    setJobError(null);
+    setConfirmingJob(false);
+    setCancellingJob(false);
+    setJobActionError(null);
   }
 
   async function confirmJob() {
@@ -1679,7 +1708,7 @@ export default function App() {
   const sessionLabel = userId ? userId.slice(0, 12) : "loading";
   const chatBusy = status === "submitted" || status === "streaming" || isLoading;
   const chatFailed = status === "error" || Boolean(error || chatError);
-  const canSend = Boolean(userId && input.trim() && !chatBusy);
+  const canSend = Boolean(userId && input.trim() && !chatBusy && !uploading);
   const noConnections = TOOLKITS.every((toolkit) => connections[toolkit] !== "connected");
   // Keep the side panel (run trace / workflow job / confirmations) collapsed until
   // there's actually something to show, so the empty/first-load state is chat-first

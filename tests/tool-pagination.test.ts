@@ -50,4 +50,24 @@ describe("maybePaginateCollectionRead", () => {
 
     expect(result.data.messages).toHaveLength(23);
   });
+
+  const countFieldCases = ["max_results", "maxResults", "limit", "per_page", "page_size", "pageSize"];
+
+  for (const field of countFieldCases) {
+    test(`fetches Gmail pages only until requested count field ${field}`, async () => {
+      const calls: Record<string, unknown>[] = [];
+      const result = await maybePaginateCollectionRead(
+        "GOOGLESUPER_FETCH_EMAILS",
+        { [field]: 5 },
+        page(2, 0, "page-2"),
+        async (args) => {
+          calls.push(args);
+          return page(10, 2);
+        }
+      ) as any;
+
+      expect(result.data.messages).toHaveLength(5);
+      expect(calls).toEqual([{ [field]: 3, pageToken: "page-2" }]);
+    });
+  }
 });

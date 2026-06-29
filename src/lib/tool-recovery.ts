@@ -1,5 +1,6 @@
 import type { NormalizedToolError } from "./tool-errors";
 
+const GMAIL_FETCH_EMAILS_TOOL = "GOOGLESUPER_FETCH_EMAILS";
 const COUNT_FIELDS = ["max_results", "maxResults", "limit", "per_page", "page_size", "pageSize"];
 const VERBOSITY_FIELDS = [
   "verbose",
@@ -72,6 +73,24 @@ export function normalizeToolArgs(toolSlug: string, args: Record<string, unknown
   return reducePayloadArgs(args, 100);
 }
 
+export function applyPromptLimitToToolArgs(
+  toolSlug: string,
+  args: Record<string, unknown>,
+  prompt?: string
+) {
+  if (toolSlug !== GMAIL_FETCH_EMAILS_TOOL) {
+    return { ...args };
+  }
+
+  const promptLimit = explicitGmailLimit(prompt ?? "");
+  if (!promptLimit) {
+    return { ...args };
+  }
+
+  const countField = COUNT_FIELDS.find((field) => field in args) ?? "max_results";
+  return { ...args, [countField]: promptLimit };
+}
+
 export function buildRetryArgs(
   toolSlug: string,
   args: Record<string, unknown>,
@@ -119,4 +138,31 @@ function reducePayloadArgs(args: Record<string, unknown>, safeLimit: number) {
 function toPositiveInt(value: unknown, fallback: number) {
   const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function explicitGmailLimit(prompt: string) {
+  const lower = prompt.toLowerCase();
+  if (!/\b(?:email|emails|gmail|inbox|message|messages)\b/.test(lower)) {
+    return undefined;
+  }
+
+  const patterns = [
+    /\b(?:last|latest|recent|newest|top|first|oldest|earliest)\s+(\d{1,4})\s+(?:gmail\s+)?(?:emails?|messages?)\b/,
+    /\b(\d{1,4})\s+(?:most\s+recent|recent|latest|newest|last|oldest|earliest|top|first)\s+(?:gmail\s+)?(?:emails?|messages?)\b/,
+    /\b(?:read|fetch|get|list|show|scan|summari[sz]e)\s+(?:the\s+)?(?:(?:exactly|only|just|up to|at most|no more than|limit(?:ed)? to|last|latest|recent|newest|top|first)\s+)?(\d{1,4})\s+(?:gmail\s+)?(?:emails?|messages?)\b/,
+    /\b(\d{1,4})\s+(?:gmail\s+)?(?:emails?|messages?)\b/,
+    /\b(?:emails?|messages?|gmail|inbox)\b.{0,40}\blimit(?:ed)?(?:\s+to)?\s+(\d{1,4})\b/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = lower.match(pattern);
+    if (match) {
+      const limit = toPositiveInt(match[1], 0);
+      if (limit > 0) {
+        return limit;
+      }
+    }
+  }
+
+  return undefined;
 }

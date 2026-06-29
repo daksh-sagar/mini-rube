@@ -26,6 +26,7 @@ const MAX_FIELDS_PER_ITEM = 12;
 const MAX_STRING_FIELD_LENGTH = 600;
 const GMAIL_FETCH_EMAILS_TOOL = "GOOGLESUPER_FETCH_EMAILS";
 const GMAIL_MAX_ITEMS = 100;
+const GITHUB_MAX_ITEMS = 100;
 const COUNT_FIELDS = ["max_results", "maxResults", "limit", "per_page", "page_size", "pageSize"];
 
 const FIELD_PRIORITY = [
@@ -77,6 +78,10 @@ export function compactToolResult(
     return compactGmailEmailCollection(toolSlug, collection, options);
   }
 
+  if (collection && isGithubCollectionTool(toolSlug)) {
+    return compactGithubIssueCollection(toolSlug, collection, options);
+  }
+
   if (collection && (text.length > options.maxLength || collection.items.length >= COLLECTION_MIN_ITEMS)) {
     return compactCollection(toolSlug, collection, options);
   }
@@ -119,7 +124,7 @@ function compactGmailEmailCollection(
   options: CompactOptions
 ) {
   const promptTerms = termSet(options.prompt ?? "");
-  const requested = requestedItemCount(options);
+  const requested = requestedItemCount(options, GMAIL_MAX_ITEMS);
   const targetCount = Math.min(
     collection.items.length,
     options.maxItems ?? requested,
@@ -217,6 +222,68 @@ function compactGmailEmailCollection(
     : compacted;
 }
 
+function compactGithubIssueCollection(
+  toolSlug: string,
+  collection: CollectionCandidate,
+  options: CompactOptions
+) {
+  const promptTerms = termSet(options.prompt ?? "");
+  const requested = requestedItemCount(options, GITHUB_MAX_ITEMS);
+  const targetCount = Math.min(collection.items.length, options.maxItems ?? requested, GITHUB_MAX_ITEMS);
+
+  let returnedCount = targetCount;
+  let bodyLength = 260;
+  let includeBody = true;
+  let compacted = buildGithubIssueCollectionResult(
+    toolSlug,
+    collection,
+    promptTerms,
+    returnedCount,
+    bodyLength,
+    includeBody
+  );
+
+  while (stringify(compacted).length > options.maxLength && bodyLength > 80) {
+    bodyLength = Math.max(80, Math.floor(bodyLength * 0.7));
+    compacted = buildGithubIssueCollectionResult(
+      toolSlug,
+      collection,
+      promptTerms,
+      returnedCount,
+      bodyLength,
+      includeBody
+    );
+  }
+
+  if (stringify(compacted).length > options.maxLength) {
+    includeBody = false;
+    compacted = buildGithubIssueCollectionResult(
+      toolSlug,
+      collection,
+      promptTerms,
+      returnedCount,
+      bodyLength,
+      includeBody
+    );
+  }
+
+  while (returnedCount > 1 && stringify(compacted).length > options.maxLength) {
+    returnedCount = Math.max(1, Math.floor(returnedCount * 0.9));
+    compacted = buildGithubIssueCollectionResult(
+      toolSlug,
+      collection,
+      promptTerms,
+      returnedCount,
+      bodyLength,
+      includeBody
+    );
+  }
+
+  return stringify(compacted).length > options.maxLength
+    ? compactJson(compacted, options.maxLength)
+    : compacted;
+}
+
 function buildGmailCollectionResult(
   toolSlug: string,
   collection: CollectionCandidate,
@@ -284,13 +351,68 @@ function projectGmailMessage(
   return projected;
 }
 
-function requestedItemCount(options: CompactOptions) {
+function buildGithubIssueCollectionResult(
+  toolSlug: string,
+  collection: CollectionCandidate,
+  promptTerms: Set<string>,
+  returnedCount: number,
+  bodyLength: number,
+  includeBody: boolean
+) {
+  return {
+    resultType: "collection",
+    sourceTool: toolSlug,
+    path: collection.path,
+    itemCount: collection.items.length,
+    returnedCount,
+    truncated: returnedCount < collection.items.length,
+    note:
+      returnedCount < collection.items.length
+        ? "GitHub issues were compacted by field first; only excess items beyond the requested/safe count were omitted."
+        : includeBody
+          ? "GitHub issues were compacted to preserve one item per issue with short body excerpts."
+          : "GitHub issues were compacted to preserve one item per issue while dropping long body fields.",
+    items: collection.items
+      .slice(0, returnedCount)
+      .map((item, index) => projectGithubIssue(item, index, promptTerms, bodyLength, includeBody)),
+  };
+}
+
+function projectGithubIssue(
+  record: Record<string, unknown>,
+  index: number,
+  promptTerms: Set<string>,
+  bodyLength: number,
+  includeBody: boolean
+) {
+  const fields = collectFieldCandidates(record, promptTerms);
+  const projected: Record<string, string | number | boolean> = { index: index + 1 };
+
+  addProjected(projected, "number", pickField(fields, ["number"]), 60);
+  addProjected(projected, "title", pickField(fields, ["title", "name", "subject"]), 220);
+  addProjected(projected, "state", pickField(fields, ["state", "status"]), 80);
+  addProjected(projected, "createdAt", pickField(fields, ["createdAt", "date"]), 90);
+  addProjected(projected, "updatedAt", pickField(fields, ["updatedAt"]), 90);
+  addProjected(projected, "htmlUrl", pickPreferredField(fields, ["htmlUrl", "webUrl", "url"]), 240);
+  addProjected(projected, "comments", pickField(fields, ["comments"]), 40);
+  if (includeBody) {
+    addProjected(projected, "body", pickField(fields, ["body", "summary", "description", "text"]), bodyLength);
+  }
+
+  return projected;
+}
+
+function requestedItemCount(options: CompactOptions, maxItems: number) {
   const args = options.args ?? {};
   for (const field of COUNT_FIELDS) {
     const parsed = toPositiveInt(args[field]);
-    if (parsed != null) return Math.min(parsed, GMAIL_MAX_ITEMS);
+    if (parsed != null) return Math.min(parsed, maxItems);
   }
-  return options.maxItems ?? GMAIL_MAX_ITEMS;
+  return options.maxItems ?? maxItems;
+}
+
+function isGithubCollectionTool(toolSlug: string) {
+  return toolSlug.startsWith("GITHUB_");
 }
 
 function pickField(fields: FieldCandidate[], keys: string[]) {
@@ -298,6 +420,14 @@ function pickField(fields: FieldCandidate[], keys: string[]) {
   return fields
     .filter((field) => keySet.has(field.key))
     .sort((a, b) => b.score - a.score)[0]?.value;
+}
+
+function pickPreferredField(fields: FieldCandidate[], keys: string[]) {
+  for (const key of keys) {
+    const match = fields.filter((field) => field.key === key).sort((a, b) => b.score - a.score)[0];
+    if (match) return match.value;
+  }
+  return undefined;
 }
 
 function addProjected(

@@ -1,1 +1,1 @@
-export { normalizeToolArgs } from "./tool-recovery";
+export { applyPromptLimitToToolArgs, normalizeToolArgs } from "./tool-recovery";

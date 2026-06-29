@@ -12,6 +12,7 @@ describe("auth requirements", () => {
     expect(tools).toContain("GOOGLESUPER_PARSE_FILE");
     expect(tools).toContain("GOOGLESUPER_SHEET_FROM_JSON");
     expect(tools).toContain("GOOGLESUPER_SPREADSHEETS_VALUES_APPEND");
+    expect(tools).toContain("GOOGLESUPER_GET_BATCH_VALUES");
   });
 
   test("github auth covers issue report workflow", () => {

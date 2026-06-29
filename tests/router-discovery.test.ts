@@ -6,10 +6,12 @@ process.env.GOOGLESUPER_AUTH_CONFIG_ID ??= "test";
 process.env.GITHUB_AUTH_CONFIG_ID ??= "test";
 process.env.OPENROUTER_API_KEY ??= "test";
 
+const { filterAllowedToolCatalog } = await import("../src/lib/tool-catalog");
 const { rankCatalogByPrompt, routeToolsForPrompt } = await import("../src/lib/router");
 
-// A catalog that includes toolkits the hand-written intent registry never knew
-// about (Slack, Linear). Generalization means these are still discoverable.
+// A catalog that includes tools outside Mini Rube's supported surface. Pure
+// lexical ranking can rank them, but routeToolsForPrompt filters them out before
+// the LLM or deterministic router can select them.
 const extendedCatalog: ToolCatalogEntry[] = [
   tool("GOOGLESUPER_FETCH_EMAILS", "Fetch emails from Gmail", "googlesuper"),
   tool("GOOGLESUPER_SEND_EMAIL", "Send an email", "googlesuper"),
@@ -29,8 +31,6 @@ describe("rankCatalogByPrompt (toolkit-agnostic discovery)", () => {
 
     expect(ranked.length).toBeGreaterThan(0);
     expect(ranked[0].tool.slug).toBe("SLACK_SEND_MESSAGE");
-    // The Slack tool was never added to the intent registry, yet it wins on
-    // description relevance alone — new toolkits work without code changes.
     expect(ranked.some((entry) => entry.tool.toolkit === "slack")).toBe(true);
   });
 
@@ -44,17 +44,21 @@ describe("rankCatalogByPrompt (toolkit-agnostic discovery)", () => {
   });
 });
 
-describe("routeToolsForPrompt discovery gating", () => {
-  test("cannot reach an unregistered toolkit's tools when discovery is off", async () => {
+describe("routeToolsForPrompt allowlist gating", () => {
+  test("filters unsupported toolkit tools before routing", async () => {
+    const filtered = filterAllowedToolCatalog(extendedCatalog);
+
+    expect(filtered.some((tool) => /^(SLACK|LINEAR)_/.test(tool.slug))).toBe(false);
+    expect(filtered.map((tool) => tool.slug)).toContain("GOOGLESUPER_FETCH_EMAILS");
+  });
+
+  test("cannot reach unsupported toolkit tools through routing", async () => {
     const result = await routeToolsForPrompt("send a slack message to the team", {
       catalog: extendedCatalog,
       useLLM: false,
       discovery: false,
     });
 
-    // The hand-written registry only knows Google/GitHub, so with discovery off
-    // it can never select a Slack/Linear tool — that is exactly why discovery
-    // over the live catalog is needed for new toolkits.
     expect(result.slugs.every((slug) => !/^(SLACK|LINEAR)_/.test(slug))).toBe(true);
     expect(result.routingMode).not.toBe("catalog_llm");
     expect(result.routingMode).not.toBe("catalog_lexical");

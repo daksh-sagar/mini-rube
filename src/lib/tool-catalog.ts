@@ -1,5 +1,7 @@
 import { getTool, listToolSlugs } from "./tools";
 import { AUTH_CONFIGS } from "./composio";
+import { ROUTER_INTENTS } from "./intent-registry";
+import { TOOLKIT_AUTH_REQUIREMENTS } from "./auth-requirements";
 import type { ComposioToolSchema, ToolCatalogEntry } from "./types";
 
 // Toolkits the agent discovers / loads / executes over = whatever has a configured
@@ -14,6 +16,23 @@ export const SUPPORTED_TOOLKITS = supportedToolkits();
 
 let catalogCache: ToolCatalogEntry[] | null = null;
 const schemaCache = new Map<string, ComposioToolSchema>();
+
+// Product allowlist: only tools used by Mini Rube's supported Gmail, Calendar,
+// Contacts, Drive, Sheets, and GitHub issue workflows are exposed to routing.
+// This keeps the LLM-first router from choosing unrelated tools from broad
+// Composio toolkits.
+const INTERNAL_WORKFLOW_TOOL_SLUGS = [
+  // Workflows read the created sheet's header row before appending later rows.
+  "GOOGLESUPER_GET_BATCH_VALUES",
+];
+
+const SUPPORTED_TOOL_SLUGS = new Set([
+  ...ROUTER_INTENTS.flatMap((intent) => intent.toolSlugs),
+  ...Object.values(TOOLKIT_AUTH_REQUIREMENTS).flatMap((requirements) =>
+    requirements.flatMap((requirement) => requirement.tools)
+  ),
+  ...INTERNAL_WORKFLOW_TOOL_SLUGS,
+]);
 
 export async function getToolCatalog(forceRefresh = false): Promise<ToolCatalogEntry[]> {
   if (catalogCache && !forceRefresh) {
@@ -43,6 +62,14 @@ export async function getToolCatalog(forceRefresh = false): Promise<ToolCatalogE
 
 export const listToolCatalog = getToolCatalog;
 export const listComposioToolCatalog = getToolCatalog;
+
+export function supportedToolSlugs() {
+  return [...SUPPORTED_TOOL_SLUGS].sort();
+}
+
+export function filterAllowedToolCatalog(catalog: ToolCatalogEntry[]) {
+  return catalog.filter((tool) => isAllowedToolSlug(tool.slug, tool.toolkit));
+}
 
 export async function loadToolSchemas(slugs: string[]): Promise<ComposioToolSchema[]> {
   const uniqueSlugs = [...new Set(slugs)].filter(Boolean);
@@ -131,12 +158,16 @@ export function clearToolCatalogCache() {
 }
 
 export function isAllowedToolSlug(slug: string, toolkit?: string) {
+  const normalizedSlug = slug.trim();
   // Composio meta tools are off-limits per the brief, regardless of toolkit.
-  if (slug.startsWith("COMPOSIO_")) {
+  if (normalizedSlug.startsWith("COMPOSIO_")) {
+    return false;
+  }
+  if (!SUPPORTED_TOOL_SLUGS.has(normalizedSlug)) {
     return false;
   }
   // A slug's toolkit is its first segment (GOOGLESUPER_… → googlesuper).
-  const slugToolkit = slug.split("_")[0]?.toLowerCase();
+  const slugToolkit = normalizedSlug.split("_")[0]?.toLowerCase();
   if (!slugToolkit) {
     return false;
   }

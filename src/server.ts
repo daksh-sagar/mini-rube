@@ -3,14 +3,21 @@ import { extname, isAbsolute, join, normalize, relative, resolve, sep } from "no
 import { AUTH_CONFIGS } from "./lib/composio";
 import { connectAccount, deleteConnectedAccount, deleteConnectedAccountsForToolkit, getConnectedAccounts } from "./lib/auth";
 import { authRequirementsForToolkit } from "./lib/auth-requirements";
-import { executeTool, listToolSlugs } from "./lib/tools";
+import { executeTool } from "./lib/tools";
 import { AGENT_MAX_TOKENS, AGENT_MODEL, agentModel } from "./lib/llm";
 import { uploadPdfToComposio, type UploadedFileRef } from "./lib/files";
 import { normalizeToolError, toolErrorForModel } from "./lib/tool-errors";
-import { buildRetryArgs, isMutatingToolSlug, normalizeToolArgs } from "./lib/tool-recovery";
+import { applyPromptLimitToToolArgs, buildRetryArgs, isMutatingToolSlug, normalizeToolArgs } from "./lib/tool-recovery";
 import { compactToolResult } from "./lib/tool-results";
 import { maybePaginateCollectionRead } from "./lib/tool-pagination";
-import { getToolInputSchema, getToolSlug, loadToolSchemas, supportedToolkits } from "./lib/tool-catalog";
+import {
+  getToolCatalog,
+  getToolInputSchema,
+  getToolSlug,
+  loadToolSchemas,
+  supportedToolkits,
+  supportedToolSlugs,
+} from "./lib/tool-catalog";
 import { routeToolsForPrompt } from "./lib/router";
 import { DEFAULT_CALENDAR_TIMEZONE, parseCalendarEventDraft, type CalendarEventDraft } from "./lib/calendar-intent";
 import { createSqliteWorkflowStore, type WorkflowJob } from "./lib/job-store";
@@ -63,6 +70,7 @@ const workflowApprovals = new Map<
 const preApprovedWorkflowJobs = new Set<string>();
 const workflowJobRuns = new Map<string, string>();
 const cancelledWorkflowJobs = new Set<string>();
+const CLEAR_ACTIVE_JOB_HEADER = "x-mini-rube-clear-active-job";
 const PORT = Number(process.env.PORT ?? 3001);
 const IDLE_TIMEOUT_SECONDS = Number(process.env.BUN_IDLE_TIMEOUT ?? 120);
 const STATIC_DIR = resolve(import.meta.dir, "app/dist");
@@ -195,6 +203,46 @@ function messageText(message: CoreMessage) {
       .join("\n");
   }
   return "";
+}
+
+function routeMessages(messages: CoreMessage[]) {
+  return messages
+    .filter((message): message is CoreMessage & { role: "user" | "assistant" } =>
+      message.role === "user" || message.role === "assistant"
+    )
+    .map((message) => ({
+      role: message.role,
+      content: messageText(message),
+    }))
+    .filter((message) => message.content.trim().length > 0);
+}
+
+function previousUserBeforeLatest(messages: CoreMessage[]) {
+  let seenLatest = false;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role !== "user") {
+      continue;
+    }
+    if (!seenLatest) {
+      seenLatest = true;
+      continue;
+    }
+    const text = messageText(message).trim();
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function combinedFollowupPrompt(messages: CoreMessage[], prompt: string) {
+  const previous = previousUserBeforeLatest(messages);
+  return previous ? `${previous}\n${prompt}` : prompt;
+}
+
+function promptHasContextualReference(prompt: string) {
+  return /\b(?:again|above|it|that|them|these|those|this|same|previous|prior|ones)\b/i.test(prompt);
 }
 
 // Reinforce attachment context inside the conversation itself. A multi-turn
@@ -351,6 +399,13 @@ function makeLocalTextResponse(text: string, runId: string, extraHeaders: Record
   });
 }
 
+function clearActiveJobHeaders(route: Pick<RouteToolsResult, "intentIds" | "routeScope">): Record<string, string> {
+  if (route.routeScope === "standalone" && !isWorkflowIntent(route.intentIds)) {
+    return { [CLEAR_ACTIVE_JOB_HEADER]: "true" };
+  }
+  return {};
+}
+
 // Friendly names for the toolkits we ship today. Any toolkit not listed here
 // falls back to a capitalized slug, so new toolkits work without code changes.
 const TOOLKIT_LABELS: Record<string, string> = {
@@ -402,6 +457,19 @@ function missingToolSchemaText(route: { slugs: string[] }, runId: string) {
 This is a tool-catalog loading problem, not a Gmail connection problem. Refresh the app and try again; if it repeats, reconnect Google from the top bar.
 
 I did not run any tools or create any pending actions.`;
+}
+
+function unsupportedNoToolActionText() {
+  return `I don't have a supported tool for that action in Mini Rube.
+
+I did not run any tools or create any pending actions.`;
+}
+
+function isUnsupportedNoToolAction(prompt: string) {
+  return (
+    /\b(?:append|archive|book|create|delete|post|remove|schedule|send|trash|update|write)\b/i.test(prompt) &&
+    /\b(?:calendar|doc|drive|email|event|file|folder|github|issue|linear|mail|meeting|message|pr|pull request|repo|sheet|slack|spreadsheet|task)\b/i.test(prompt)
+  );
 }
 
 function redactEmailsForCalendar(toolSlug: string, value: string) {
@@ -720,11 +788,71 @@ function calendarDraftResponse(
   userId: string,
   prompt: string,
   route: { slugs: string[]; rationale: string },
-  draft: CalendarEventDraft
+  draft: CalendarEventDraft,
+  extraHeaders: Record<string, string> = {}
 ) {
   const run = createRun(userId, prompt, route.slugs, `${route.rationale} (deterministic calendar draft)`);
   createPendingAction(userId, run, "GOOGLESUPER_CREATE_EVENT", draft.args);
-  return makeLocalTextResponse(calendarDraftText(draft), run.id);
+  return makeLocalTextResponse(calendarDraftText(draft), run.id, extraHeaders);
+}
+
+function emailDraftResponse(
+  userId: string,
+  prompt: string,
+  route: { slugs: string[]; rationale: string },
+  draft: EmailDraft,
+  extraHeaders: Record<string, string> = {}
+) {
+  const run = createRun(userId, prompt, route.slugs, `${route.rationale} (deterministic email draft)`);
+  createPendingAction(userId, run, "GOOGLESUPER_SEND_EMAIL", draft.args);
+  return makeLocalTextResponse(emailDraftText(draft), run.id, extraHeaders);
+}
+
+type EmailDraft = {
+  args: Record<string, unknown>;
+  display: {
+    recipient: string;
+    subject: string;
+    body: string;
+    attachmentNames: string;
+  };
+};
+
+function emailDraftText(draft: EmailDraft) {
+  return `I prepared the email and it is waiting for your confirmation in the UI.
+
+- To: ${draft.display.recipient}
+- Subject: ${draft.display.subject}
+- Body: ${draft.display.body}
+- Attachment: ${draft.display.attachmentNames}
+
+Click Confirm to send it.`;
+}
+
+function attachedPdfMissingText(staleFileIds: boolean) {
+  if (staleFileIds) {
+    return "The PDF chip in the chat points to an upload the server no longer has. Please remove it, upload the PDF again with the PDF button, then send the email request again.";
+  }
+
+  return "I don't see a PDF attached to this chat. Please upload the PDF using the app's PDF button, then send the email request again.";
+}
+
+function attachedPdfMissingResponse(
+  userId: string,
+  prompt: string,
+  route: { slugs: string[]; rationale: string },
+  staleFileIds: boolean,
+  extraHeaders: Record<string, string> = {}
+) {
+  const text = attachedPdfMissingText(staleFileIds);
+  const run = createRun(userId, prompt, route.slugs, `${route.rationale} (missing attached PDF)`);
+  addTrace(run, {
+    type: "info",
+    title: staleFileIds ? "Stale attached file" : "Missing attached file",
+    detail: text,
+  });
+  run.status = "completed";
+  return makeLocalTextResponse(text, run.id, extraHeaders);
 }
 
 function calendarDraftText(draft: CalendarEventDraft) {
@@ -832,6 +960,7 @@ function activeTaskRoute(task: ActiveTask): RouteToolsResult {
     intentIds: [task.intentId],
     confidence: 1,
     routingMode: "deterministic",
+    routeScope: "contextual_followup",
   };
 }
 
@@ -915,7 +1044,16 @@ function looksLikeNewNonCalendarIntent(prompt: string) {
     (/\b(?:send|reply|forward|draft|write|github|issue|issues|sheet|spreadsheet|drive|resume|resumes)\b/i.test(
       prompt
     ) ||
+      isEmailReadRequest(prompt) ||
       /\b(?:email|mail)\s+(?:it|this|that|them|him|her|to)\b/i.test(prompt))
+  );
+}
+
+function isEmailReadRequest(prompt: string) {
+  return (
+    /\b(?:read|fetch|get|show|list|scan|summari[sz]e)\b/i.test(prompt) &&
+    /\b(?:emails?|gmail|inbox|messages?|subjects?)\b/i.test(prompt) &&
+    !/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(prompt)
   );
 }
 
@@ -982,13 +1120,17 @@ async function maybeResumeWorkflowFromFollowup(
 ) {
   const previous = latestAssistantText(messages);
   if (!previous || prompt.trim().length > 200) return null;
+  const workflowPrompt = combinedFollowupPrompt(messages, prompt);
 
   if (previous.includes("which GitHub repository")) {
+    if (!isGithubWorkflowSourceReply(prompt)) {
+      return null;
+    }
     const repo = resolveGithubRepoRequest(prompt);
     if ("repository" in repo) {
       const workflow = isWorkflowIntent(["github.issues_to_sheet"]);
       if (workflow) {
-        return startWorkflowResponse(workflow, userId, prompt, [], "repository provided in follow-up", {
+        return startWorkflowResponse(workflow, userId, workflowPrompt, [], "repository provided in follow-up", {
           repository: repo.repository,
         });
       }
@@ -1000,13 +1142,56 @@ async function maybeResumeWorkflowFromFollowup(
     if ("folderId" in resolution) {
       const workflow = isWorkflowIntent(["drive.resumes_to_sheet"]);
       if (workflow) {
-        return startWorkflowResponse(workflow, userId, prompt, [], "folder provided in follow-up", {
+        return startWorkflowResponse(workflow, userId, workflowPrompt, [], "folder provided in follow-up", {
           folderId: resolution.folderId,
         });
       }
     }
   }
   return null;
+}
+
+function isGithubWorkflowSourceReply(prompt: string) {
+  if (isReadOnlyGithubPrompt(prompt)) {
+    return false;
+  }
+  return !/\b(?:email|emails|gmail|inbox|calendar|event|meeting|drive|folder|resume|resumes)\b/i.test(prompt);
+}
+
+function isReadOnlyGithubPrompt(prompt: string) {
+  const lower = prompt.toLowerCase();
+  return (
+    /\b(?:just|only|simply)?\s*(?:get|fetch|read|show|list|summari[sz]e)\b/.test(lower) &&
+    /\b(?:issue|issues|github|repo|repository|pull request|pull requests)\b/.test(lower) &&
+    (/\b(?:don'?t|do not|without|no)\s+(?:write|create|make|export|append|put|save)\b/.test(lower) ||
+      !/\b(?:sheet|spreadsheet|table|csv)\b/.test(lower))
+  );
+}
+
+async function resolveDriveFolderForWorkflow(messages: CoreMessage[], prompt: string, userId: string) {
+  const direct = await resolveDriveFolderRequest(prompt, (slug, args) => executeTool(slug, userId, args));
+  if (!("ask" in direct) || !promptHasContextualReference(prompt)) {
+    return { resolution: direct, promptForJob: prompt };
+  }
+
+  const contextualPrompt = combinedFollowupPrompt(messages, prompt);
+  const contextual = await resolveDriveFolderRequest(contextualPrompt, (slug, args) => executeTool(slug, userId, args));
+  return "ask" in contextual
+    ? { resolution: direct, promptForJob: prompt }
+    : { resolution: contextual, promptForJob: contextualPrompt };
+}
+
+function resolveGithubRepoForWorkflow(messages: CoreMessage[], prompt: string) {
+  const direct = resolveGithubRepoRequest(prompt);
+  if (!("ask" in direct) || !promptHasContextualReference(prompt)) {
+    return { resolution: direct, promptForJob: prompt };
+  }
+
+  const contextualPrompt = combinedFollowupPrompt(messages, prompt);
+  const contextual = resolveGithubRepoRequest(contextualPrompt);
+  return "ask" in contextual
+    ? { resolution: direct, promptForJob: prompt }
+    : { resolution: contextual, promptForJob: contextualPrompt };
 }
 
 function jobResponse(job: WorkflowJob) {
@@ -1125,13 +1310,75 @@ function attachmentS3Key(ref: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
+function parseAttachedEmailDraft(prompt: string, files: UploadedFileRef[]): EmailDraft | null {
+  if (files.length === 0 || !/\b(?:send|email|mail)\b/i.test(prompt)) {
+    return null;
+  }
+
+  const recipient = prompt.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0];
+  if (!recipient) {
+    return null;
+  }
+
+  const subject = extractEmailField(prompt, "subject");
+  const body = extractEmailField(prompt, "body|message|content");
+  if (!subject && !body) {
+    return null;
+  }
+
+  const uploadables = files
+    .map((file) => ({
+      name: file.filename,
+      mimetype: file.mimeType && file.mimeType.includes("/") ? file.mimeType : "application/pdf",
+      s3key: attachmentS3Key(file.composioFileRef),
+    }))
+    .filter((file) => file.s3key);
+
+  if (uploadables.length === 0) {
+    return null;
+  }
+
+  return {
+    args: {
+      recipient_email: recipient,
+      subject: subject ?? "",
+      body: body ?? "",
+      is_html: false,
+      user_id: "me",
+      attachment: uploadables.length === 1 ? uploadables[0] : uploadables,
+    },
+    display: {
+      recipient,
+      subject: subject ?? "(no subject)",
+      body: body ?? "(empty body)",
+      attachmentNames: files.map((file) => file.filename).join(", "),
+    },
+  };
+}
+
+function extractEmailField(prompt: string, fieldPattern: string) {
+  const pattern = new RegExp(
+    `\\b(?:${fieldPattern})\\s*[:=-]?\\s*(.+?)(?=\\s*,?\\s*(?:subject|body|message|content)\\b|$)`,
+    "i"
+  );
+  return prompt.match(pattern)?.[1]?.trim().replace(/[.。]\s*$/u, "") || null;
+}
+
+function isAttachedPdfEmailRequest(route: Pick<RouteToolsResult, "intentIds" | "slugs">, prompt: string) {
+  return (
+    route.intentIds?.includes("email.send_with_upload") ||
+    (route.slugs.includes("GOOGLESUPER_SEND_EMAIL") &&
+      /\b(?:attached|attachment|attach|uploaded|upload|pdf|pdfs)\b/i.test(prompt))
+  );
+}
+
 async function executeToolWithRecovery(
   toolSlug: string,
   userId: string,
   initialArgs: Record<string, unknown>,
   run: RunState
 ) {
-  let args = normalizeToolArgs(toolSlug, initialArgs);
+  let args = normalizeToolArgs(toolSlug, applyPromptLimitToToolArgs(toolSlug, initialArgs, run.prompt));
 
 	  for (let attempt = 1; attempt <= 3; attempt += 1) {
 	    try {
@@ -1809,7 +2056,13 @@ Bun.serve({
     "/api/tools": {
       async GET() {
         try {
-          const tools = await listToolSlugs(supportedToolkits());
+          const liveTools = await getToolCatalog();
+          const liveBySlug = new Map(liveTools.map((tool) => [tool.slug, tool]));
+          const tools = supportedToolSlugs().map((slug) => liveBySlug.get(slug) ?? {
+            slug,
+            description: "",
+            toolkit: toolkitForSlug(slug),
+          });
           return Response.json({ tools });
         } catch (err: any) {
           return Response.json({ error: err.message }, { status: 500 });
@@ -1847,10 +2100,37 @@ Bun.serve({
         if (resumed) return resumed;
 
         const activeCalendarTask = activeCalendarTaskForFollowup(userId, messages, prompt);
-        const route = activeCalendarTask ? activeTaskRoute(activeCalendarTask) : await routeToolsForPrompt(prompt);
+        const route = activeCalendarTask
+          ? activeTaskRoute(activeCalendarTask)
+          : await routeToolsForPrompt(prompt, {
+              messages: routeMessages(messages),
+            });
+        const routeResponseHeaders = clearActiveJobHeaders(route);
         let calendarTask = activeCalendarTask;
         if (!calendarTask && routeIsCalendarSchedule(route)) {
           calendarTask = saveCalendarTask(userId, prompt, route);
+        }
+
+        if (route.routeScope === "ambiguous" && route.clarification) {
+          const run = createRun(userId, prompt, [], route.rationale);
+          run.status = "completed";
+          addTrace(run, {
+            type: "info",
+            title: "Ambiguous follow-up",
+            detail: route.clarification,
+          });
+          return makeLocalTextResponse(route.clarification, run.id);
+        }
+
+        if (route.slugs.length === 0 && isUnsupportedNoToolAction(prompt)) {
+          const run = createRun(userId, prompt, [], "no supported tool route");
+          run.status = "completed";
+          addTrace(run, {
+            type: "info",
+            title: "No supported tool",
+            detail: "The request asks for an external action outside the supported tool surface.",
+          });
+          return makeLocalTextResponse(unsupportedNoToolActionText(), run.id, routeResponseHeaders);
         }
 
         const requiredToolkits = requiredToolkitsForSlugs(route.slugs);
@@ -1866,7 +2146,7 @@ Bun.serve({
               title: "Missing connection",
               detail: missingToolkits.map(connectionLabel).join(", "),
             });
-            return makeLocalTextResponse(missingConnectionText(missingToolkits, run.id), run.id);
+            return makeLocalTextResponse(missingConnectionText(missingToolkits, run.id), run.id, routeResponseHeaders);
           }
         }
 
@@ -1876,23 +2156,24 @@ Bun.serve({
           // front; if we can't, ask the user conversationally instead of starting a
           // job that would just fail.
           const extraInput: Record<string, unknown> = {};
+          let workflowPrompt = prompt;
           if (workflow.id === "drive.resumes_to_sheet") {
-            const resolution = await resolveDriveFolderRequest(prompt, (slug, args) =>
-              executeTool(slug, userId, args)
-            );
+            const { resolution, promptForJob } = await resolveDriveFolderForWorkflow(messages, prompt, userId);
             if ("ask" in resolution) {
               return workflowInputNeededResponse(userId, prompt, route, resolution.ask);
             }
+            workflowPrompt = promptForJob;
             extraInput.folderId = resolution.folderId;
           } else if (workflow.id === "github.issues_to_sheet") {
-            const resolution = resolveGithubRepoRequest(prompt);
+            const { resolution, promptForJob } = resolveGithubRepoForWorkflow(messages, prompt);
             if ("ask" in resolution) {
               return workflowInputNeededResponse(userId, prompt, route, resolution.ask);
             }
+            workflowPrompt = promptForJob;
             extraInput.repository = resolution.repository;
           }
 
-          return startWorkflowResponse(workflow, userId, prompt, route.slugs, route.rationale, extraInput);
+          return startWorkflowResponse(workflow, userId, workflowPrompt, route.slugs, route.rationale, extraInput);
         }
 
         if (routeIsCalendarSchedule(route)) {
@@ -1904,8 +2185,20 @@ Bun.serve({
           });
           if (draft) {
             clearActiveTask(userId, CALENDAR_SCHEDULE_INTENT_ID);
-            return calendarDraftResponse(userId, combinedPrompt, route, draft);
+            return calendarDraftResponse(userId, combinedPrompt, route, draft, routeResponseHeaders);
           }
+        }
+
+        const files = filesForUser(userId, fileIds);
+        if (isAttachedPdfEmailRequest(route, prompt) && files.length === 0) {
+          return attachedPdfMissingResponse(userId, prompt, route, fileIds.length > 0, routeResponseHeaders);
+        }
+
+        const emailDraft = route.slugs.includes("GOOGLESUPER_SEND_EMAIL")
+          ? parseAttachedEmailDraft(prompt, files)
+          : null;
+        if (emailDraft) {
+          return emailDraftResponse(userId, prompt, route, emailDraft, routeResponseHeaders);
         }
 
         const toolSchemas = await loadToolSchemas(route.slugs);
@@ -1917,10 +2210,9 @@ Bun.serve({
             title: "Selected tool schemas unavailable",
             detail: route.slugs.join(", "),
           });
-          return makeLocalTextResponse(missingToolSchemaText(route, run.id), run.id);
+          return makeLocalTextResponse(missingToolSchemaText(route, run.id), run.id, routeResponseHeaders);
         }
         const run = createRun(userId, prompt, toolSchemas.map(getToolSlug).filter(Boolean), route.rationale);
-        const files = filesForUser(userId, fileIds);
 
         if (files.length) {
           addTrace(run, {
@@ -1958,7 +2250,9 @@ You have only the selected tools for this request: ${toolsForRequest}.
 Do not mention unavailable tools. Do not use or request COMPOSIO_* meta tools.${filesNote}
 
 Format answers in Markdown: use short paragraphs, bullet lists for multiple items, and Markdown links for any URLs (sheets, docs, issues).
+When listing records that include a URL/htmlUrl/webUrl field, make each record title a Markdown link unless the user explicitly asks for plain text only.
 For missing required details, ask concise follow-up questions.
+For read-only requests, always answer with the relevant records or summary from the tool result. Never reply only with "Done", "Fetched", or a generic completion acknowledgement after a successful read.
 For large tasks, paginate and process in batches. Do not request huge context windows. When writing sheets, preserve one row per source item and include an error/status column rather than dropping failed items.
 When the user asks for a specific quantity (e.g. "my last 100 emails"), request that many; if a single read returns fewer than asked and the response includes a next-page token, fetch the next page(s) until you have the requested count or the source is exhausted. Give ONE clean final answer — do not narrate each fetch attempt ("let me try the next page…") as separate prose, and never surface raw API internals (next-page tokens, result-size estimates, fields like "itemCount" or "resultSizeEstimate", "truncated at item boundaries") to the user. A compacted preview count is not the mailbox total. If the source genuinely holds fewer items than requested, simply state the real count plainly (e.g. "Your mailbox has 23 emails — here they are:") and list them; do not present an estimate as if it were the total.
 Before sending email, creating calendar events, creating/updating sheets, or any other external mutation, the tool returns a pending action that the user must approve in the UI. Clearly describe what you are about to do and that it is awaiting confirmation. Do not claim it has been completed until the user confirms.
@@ -1994,6 +2288,7 @@ When you resolve a person's email from their name (e.g. scheduling a calendar ev
         return result.toDataStreamResponse({
           headers: {
             "x-run-id": run.id,
+            ...routeResponseHeaders,
           },
           getErrorMessage,
         });

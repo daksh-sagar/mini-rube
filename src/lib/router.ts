@@ -1,7 +1,18 @@
 import { ROUTER_INTENTS, type RouterIntent } from "./intent-registry";
 import { generateJson, PLANNER_MODEL } from "./llm";
-import { getToolCatalog } from "./tool-catalog";
-import type { RouteToolsOptions, RouteToolsResult, ToolCatalogEntry } from "./types";
+import { filterAllowedToolCatalog, getToolCatalog } from "./tool-catalog";
+import { isMutatingToolSlug } from "./tool-recovery";
+import type {
+  ActiveRouteTask,
+  LlmRouterFn,
+  LlmRouterInput,
+  LlmToolRouteResult,
+  RouteToolsOptions,
+  RouterMessage,
+  RouterStrategy,
+  RouteToolsResult,
+  ToolCatalogEntry,
+} from "./types";
 
 type ScoredIntent = {
   intent: RouterIntent;
@@ -11,6 +22,20 @@ type ScoredIntent = {
 type LlmIntentRouteResult = {
   intentIds: string[];
   rationale: string;
+};
+
+type LlmRouteContext = {
+  prompt: string;
+  routingPrompt: string;
+  routeScope: RouteToolsResult["routeScope"];
+  messages: RouterMessage[];
+  activeTask?: ActiveRouteTask;
+  catalog: ToolCatalogEntry[];
+  scored: ScoredIntent[];
+  deterministic: RouteToolsResult;
+  maxTools: number;
+  maxIntents: number;
+  llmRouter?: LlmRouterFn;
 };
 
 const DEFAULT_TOOL_DESCRIPTIONS: Record<string, string> = {
@@ -33,6 +58,7 @@ const DEFAULT_TOOL_DESCRIPTIONS: Record<string, string> = {
   GOOGLESUPER_SHEET_FROM_JSON: "Create sheet from JSON",
   GOOGLESUPER_CREATE_GOOGLE_SHEET1: "Create a Google Sheet",
   GOOGLESUPER_SPREADSHEETS_VALUES_APPEND: "Append Values to Spreadsheet",
+  GOOGLESUPER_GET_BATCH_VALUES: "Get spreadsheet values",
   GITHUB_LIST_REPOSITORY_ISSUES: "List repository issues",
   GITHUB_SEARCH_ISSUES_AND_PULL_REQUESTS: "Search issues and pull requests",
   GITHUB_GET_AN_ISSUE: "Get an issue",
@@ -51,6 +77,32 @@ const FAST_PATH_CONFIDENCE = 0.4;
 const DISCOVERY_CANDIDATES = 40;
 // Minimum lexical relevance for the offline fallback to pick a tool at all.
 const MIN_LEXICAL_SCORE = 5;
+const CONTEXTUAL_ROUTE_CONFIDENCE = 0.4;
+const MUTATION_TERMS = [
+  "send",
+  "create",
+  "schedule",
+  "book",
+  "update",
+  "append",
+  "write",
+  "draft",
+  "reply",
+  "forward",
+  "delete",
+  "remove",
+  "post",
+  "make",
+];
+const UNSUPPORTED_CAPABILITY_ACTION_TERMS = new Set([
+  "append",
+  "create",
+  "delete",
+  "post",
+  "remove",
+  "send",
+  "update",
+]);
 
 const FALLBACK_CATALOG: ToolCatalogEntry[] = DEFAULT_TOOLS.map((slug) => ({
   slug,
@@ -74,7 +126,23 @@ export async function routeToolsForPrompt(
     return buildRouteFromScoredIntents([], [], catalog, maxTools, "none");
   }
 
-  const scored = scoreIntentsForPrompt(prompt, catalog);
+  const ambiguous = ambiguousFollowupClarification(prompt, options.messages ?? []);
+  if (ambiguous) {
+    return {
+      slugs: [],
+      intentIds: [],
+      rationale: "ambiguous follow-up across multiple prior task domains",
+      confidence: 0,
+      routingMode: "none",
+      routeScope: "ambiguous",
+      clarification: ambiguous,
+    };
+  }
+
+  const routingPrompt = contextualRoutingPrompt(prompt, options.messages ?? []);
+  const routeScope: RouteToolsResult["routeScope"] =
+    routingPrompt === prompt ? "standalone" : "contextual_followup";
+  const scored = scoreIntentsForPrompt(routingPrompt, catalog);
   const deterministic = buildRouteFromScoredIntents(
     selectIntents(scored, maxIntents),
     scored,
@@ -82,6 +150,54 @@ export async function routeToolsForPrompt(
     maxTools,
     "deterministic"
   );
+
+  const strategy = resolveRouterStrategy(options);
+  let route: RouteToolsResult;
+  if (strategy === "llm_first") {
+    route = await routeLlmFirst({
+      prompt,
+      routingPrompt,
+      routeScope,
+      messages: options.messages ?? [],
+      activeTask: options.activeTask,
+      catalog,
+      scored,
+      deterministic,
+      maxTools,
+      maxIntents,
+      llmRouter: options.llmRouter,
+    });
+  } else if (strategy === "shadow") {
+    route = await routeWithLlmShadow({
+      prompt,
+      routingPrompt,
+      routeScope,
+      messages: options.messages ?? [],
+      activeTask: options.activeTask,
+      catalog,
+      scored,
+      deterministic,
+      maxTools,
+      maxIntents,
+      llmRouter: options.llmRouter,
+    }, options);
+  } else {
+    route = await routeDeterministicOrDiscovery(routingPrompt, options, catalog, scored, deterministic, maxTools, maxIntents);
+  }
+
+  const constrained = filterRouteForPromptConstraints(route, prompt, catalog);
+  return { ...constrained, routeScope: constrained.routeScope ?? routeScope };
+}
+
+async function routeDeterministicOrDiscovery(
+  prompt: string,
+  options: RouteToolsOptions,
+  catalog: ToolCatalogEntry[],
+  scored: ScoredIntent[],
+  deterministic: RouteToolsResult,
+  maxTools: number,
+  maxIntents: number
+) {
   const useLLM = options.useLLM ?? process.env.TOOL_ROUTER_USE_LLM === "1";
   // Discovery defaults to `useLLM`, so deterministic callers (tests) stay
   // deterministic, while the server (which sets neither) opts in by default.
@@ -142,6 +258,591 @@ export async function routeToolsForPrompt(
   }
 
   return deterministic;
+}
+
+async function routeLlmFirst(context: LlmRouteContext): Promise<RouteToolsResult> {
+  try {
+    const raw = await callLlmRouter(context);
+    const validated = validateLlmRoute(raw, context, "llm_first");
+    if (routeConflictsWithLatestPrompt(context, validated)) {
+      return {
+        ...context.deterministic,
+        routingMode: "llm_first_fallback",
+        rationale: `${context.deterministic.rationale}; LLM-first route conflicted with latest prompt domain`,
+      };
+    }
+    if (shouldPreserveDeterministicWorkflow(context, validated)) {
+      return {
+        ...context.deterministic,
+        routingMode: "llm_first_fallback",
+        rationale: `${context.deterministic.rationale}; LLM-first omitted required workflow tools`,
+      };
+    }
+    if (validated.slugs.length > 0) {
+      return validated;
+    }
+    if ((validated.confidence ?? 0) >= 0.7 && !hasConfidentContextualRoute(context)) {
+      return validated;
+    }
+
+    const fallback = await routeDeterministicOrDiscovery(
+      context.routingPrompt,
+      { discovery: true, useLLM: false },
+      context.catalog,
+      context.scored,
+      context.deterministic,
+      context.maxTools,
+      context.maxIntents
+    );
+    return {
+      ...fallback,
+      routingMode: "llm_first_fallback",
+      rationale: `${fallback.rationale}; LLM-first returned no usable low-confidence route`,
+    };
+  } catch (err) {
+    const fallback = await routeDeterministicOrDiscovery(
+      context.routingPrompt,
+      { discovery: true, useLLM: false },
+      context.catalog,
+      context.scored,
+      context.deterministic,
+      context.maxTools,
+      context.maxIntents
+    );
+    return {
+      ...fallback,
+      routingMode: "llm_first_fallback",
+      rationale: `${fallback.rationale}; LLM-first failed: ${errorPreview(err)}`,
+    };
+  }
+}
+
+async function routeWithLlmShadow(
+  context: LlmRouteContext,
+  options: RouteToolsOptions
+): Promise<RouteToolsResult> {
+  const active = await routeDeterministicOrDiscovery(
+    context.routingPrompt,
+    { ...options, strategy: "deterministic" },
+    context.catalog,
+    context.scored,
+    context.deterministic,
+    context.maxTools,
+    context.maxIntents
+  );
+
+  try {
+    const raw = await callLlmRouter(context);
+    const shadow = validateLlmRoute(raw, context, "shadow_llm");
+    return {
+      ...active,
+      routingMode: "shadow_llm",
+      rationale: `${active.rationale}; shadow LLM would select [${shadow.slugs.join(", ")}] (${shadow.rationale})`,
+    };
+  } catch (err) {
+    return {
+      ...active,
+      routingMode: "shadow_llm",
+      rationale: `${active.rationale}; shadow LLM failed: ${errorPreview(err)}`,
+    };
+  }
+}
+
+async function callLlmRouter(context: LlmRouteContext): Promise<LlmToolRouteResult> {
+  const input = llmRouterInput(context);
+  if (context.llmRouter) {
+    return context.llmRouter(input);
+  }
+
+  return generateJson<LlmToolRouteResult>({
+    model: PLANNER_MODEL,
+    system: [
+      "You are the first-layer tool router for an app that can only use the provided tools.",
+      "Choose intent IDs and tool slugs needed for the user's latest message. Recent conversation may fill missing references, but it must not override the latest message's domain or action.",
+      "Only return intent IDs from availableIntents and tool slugs from availableTools. Never invent tool names.",
+      "Prefer read tools for read tasks. Include mutating tools only when the user asks to send, create, update, append, schedule, or otherwise change external state.",
+      "If the task continues an active task, set isContinuation true. If no available tool fits, return empty intentIds/toolSlugs with high confidence.",
+    ].join(" "),
+    prompt: JSON.stringify({
+      ...input,
+      responseShape: {
+        intentIds: ["intent.id"],
+        toolSlugs: ["TOOLKIT_ACTION"],
+        isContinuation: false,
+        missingSlots: ["field_name"],
+        confidence: 0.0,
+        rationale: "short reason",
+      },
+    }),
+  });
+}
+
+function llmRouterInput(context: LlmRouteContext): LlmRouterInput {
+  return {
+    prompt: context.prompt,
+    messages: context.messages.slice(-8),
+    activeTask: context.activeTask,
+    availableIntents: availableIntentSummaries(context.catalog),
+    availableTools: candidateToolsForLlm(context.routingPrompt, context.catalog, context.scored, context.deterministic),
+    maxTools: context.maxTools,
+    maxIntents: context.maxIntents,
+  };
+}
+
+function hasConfidentContextualRoute(context: LlmRouteContext) {
+  return (
+    context.routeScope === "contextual_followup" &&
+    context.deterministic.slugs.length > 0 &&
+    (isWorkflowRoute(context.deterministic) ||
+      (context.deterministic.confidence ?? 0) >= CONTEXTUAL_ROUTE_CONFIDENCE)
+  );
+}
+
+function shouldPreserveDeterministicWorkflow(context: LlmRouteContext, validated: RouteToolsResult) {
+  if (!isWorkflowRoute(context.deterministic) || (context.deterministic.confidence ?? 0) < FAST_PATH_CONFIDENCE) {
+    return false;
+  }
+  if (isWorkflowRoute(validated)) {
+    return false;
+  }
+
+  const deterministicSlugs = new Set(context.deterministic.slugs);
+  return context.deterministic.slugs.some((slug) => !validated.slugs.includes(slug) && deterministicSlugs.has(slug));
+}
+
+function routeConflictsWithLatestPrompt(context: LlmRouteContext, route: RouteToolsResult) {
+  const explicit = explicitPromptDomains(context.prompt);
+  if (explicit.size === 0 || route.slugs.length === 0) {
+    return false;
+  }
+  const routeDomains = domainsForRoute(route);
+  if (routeDomains.size === 0) {
+    return false;
+  }
+  return ![...routeDomains].some((domain) => explicit.has(domain));
+}
+
+function domainsForRoute(route: RouteToolsResult) {
+  const domains = new Set<RouterIntent["domain"]>();
+  const intentById = new Map(ROUTER_INTENTS.map((intent) => [intent.id, intent]));
+  for (const intentId of route.intentIds ?? []) {
+    const domain = intentById.get(intentId)?.domain;
+    if (domain) domains.add(domain);
+  }
+  for (const slug of route.slugs) {
+    const domain = domainForToolSlug(slug);
+    if (domain) domains.add(domain);
+  }
+  return domains;
+}
+
+function domainForToolSlug(slug: string): RouterIntent["domain"] | undefined {
+  if (slug.startsWith("GITHUB_")) return "github";
+  if (slug.includes("SHEET") || slug.includes("SPREADSHEET")) return "sheet";
+  if (slug.includes("EVENT") || slug.includes("FREE_SLOT")) return "calendar";
+  if (slug.includes("CONTACT") || slug.includes("PEOPLE")) return "contacts";
+  if (
+    slug.includes("DRIVE") ||
+    slug.includes("FILE") ||
+    slug.includes("FOLDER") ||
+    slug.includes("CHILDREN") ||
+    slug.includes("PARSE")
+  ) {
+    return "drive";
+  }
+  if (slug.includes("EMAIL") || slug.includes("MESSAGE") || slug.includes("ATTACHMENT")) return "email";
+  return undefined;
+}
+
+function contextualRoutingPrompt(prompt: string, messages: RouterMessage[]) {
+  if (!shouldUseConversationContext(prompt)) {
+    return prompt;
+  }
+
+  const context = recentConversationContext(messages, prompt);
+  if (!context || !hasSupportedDomainSignal(context)) {
+    return prompt;
+  }
+
+  return `${context}\nuser: ${prompt}`;
+}
+
+function shouldUseConversationContext(prompt: string) {
+  if (!isContextualFollowup(prompt)) {
+    return false;
+  }
+  if (isSheetFromPriorItemsFollowup(prompt)) {
+    return true;
+  }
+  if (explicitPromptDomains(prompt).size > 0) {
+    return false;
+  }
+  return true;
+}
+
+function ambiguousFollowupClarification(prompt: string, messages: RouterMessage[]) {
+  if (!isBareAmbiguousFollowup(prompt)) {
+    return null;
+  }
+  const domains = recentSourceDomains(messages, prompt);
+  if (domains.length <= 1) {
+    return null;
+  }
+  const labels = domains.map(domainLabel).join(", ");
+  return `Which task should I continue: ${labels}?`;
+}
+
+function isBareAmbiguousFollowup(prompt: string) {
+  const normalized = prompt.trim().toLowerCase().replace(/[?.!]+$/g, "");
+  return /^(?:continue|do it|do that|same|same thing|that|this|them|these|those|more|show me more|again|next)$/i.test(
+    normalized
+  );
+}
+
+function recentSourceDomains(messages: RouterMessage[], prompt: string) {
+  const current = prompt.trim();
+  const domains = new Set<Exclude<RouterIntent["domain"], "sheet" | "contacts">>();
+  for (const message of messages.slice(-8)) {
+    const content = message.content.trim();
+    if (!content || (message.role === "user" && content === current)) {
+      continue;
+    }
+    for (const domain of explicitPromptDomains(content)) {
+      if (domain !== "sheet" && domain !== "contacts") {
+        domains.add(domain);
+      }
+    }
+  }
+  return [...domains];
+}
+
+function domainLabel(domain: RouterIntent["domain"]) {
+  switch (domain) {
+    case "email":
+      return "emails";
+    case "calendar":
+      return "calendar";
+    case "github":
+      return "GitHub issues";
+    case "drive":
+      return "Drive files/resumes";
+    case "sheet":
+      return "Google Sheets";
+    case "contacts":
+      return "contacts";
+  }
+}
+
+function recentConversationContext(messages: RouterMessage[], prompt: string) {
+  const current = prompt.trim();
+  const prior = messages
+    .map((message) => ({
+      role: message.role,
+      content: message.content.trim(),
+    }))
+    .filter((message) => message.content.length > 0);
+
+  if (prior.at(-1)?.role === "user" && prior.at(-1)?.content === current) {
+    prior.pop();
+  }
+
+  return prior
+    .slice(-6)
+    .map((message) => `${message.role}: ${message.content}`)
+    .join("\n")
+    .slice(-4_000);
+}
+
+function isContextualFollowup(prompt: string) {
+  return /\b(?:again|another|continue|do it|fetch|get|latest|more|newer|newest|ones|previous|prior|recent|same|that|them|these|this|those)\b/i.test(
+    prompt
+  );
+}
+
+function isSheetFromPriorItemsFollowup(prompt: string) {
+  return (
+    /\b(?:it|that|them|these|those|this|above|results?|rows?|items?)\b/i.test(prompt) &&
+    /\b(?:sheet|spreadsheet|table|csv)\b/i.test(prompt) &&
+    /\b(?:write|create|make|export|append|put|save)\b/i.test(prompt) &&
+    !/\b(?:github|repo|repository|issue|issues|drive|folder|resume|resumes|email|emails|gmail|inbox|calendar|event|meeting)\b/i.test(
+      prompt
+    )
+  );
+}
+
+function hasSupportedDomainSignal(text: string) {
+  return /\b(?:attachment|calendar|drive|email|emails|event|file|folder|github|gmail|inbox|issue|issues|mail|meeting|message|messages|pdf|pull request|repo|repository|resume|resumes|sheet|spreadsheet)\b/i.test(
+    text
+  );
+}
+
+function explicitPromptDomains(prompt: string) {
+  const lower = prompt.toLowerCase();
+  const terms = termSet(prompt);
+  const domains = new Set<RouterIntent["domain"]>();
+
+  if (
+    /\b(?:gmail|inbox|emails?|messages?|mail)\b/.test(lower) &&
+    !/\b(?:github|issue|issues|pull request|repo|repository)\b/.test(lower)
+  ) {
+    domains.add("email");
+  }
+  if (
+    /\b(?:github|repo|repository|issue|issues|pull request|pull requests|\bpr\b)\b/.test(lower) ||
+    /[a-z0-9_.-]+\/[a-z0-9_.-]+/.test(lower)
+  ) {
+    domains.add("github");
+  }
+  if (/\b(?:drive|folder|resume|resumes|candidate|candidates|pdf|pdfs|document|documents)\b/.test(lower)) {
+    domains.add("drive");
+  }
+  if (/\b(?:calendar|event|meeting|invite|agenda|schedule|book|free slot|availability)\b/.test(lower)) {
+    domains.add("calendar");
+  }
+  if (hasAny(terms, ["sheet", "spreadsheet", "table", "csv"])) {
+    domains.add("sheet");
+  }
+  if (hasAny(terms, ["contact", "contacts", "people", "person"])) {
+    domains.add("contacts");
+  }
+
+  return domains;
+}
+
+function isReadOnlyAgainstSheetWorkflow(prompt: string) {
+  const lower = prompt.toLowerCase();
+  return (
+    /\b(?:just|only|simply)?\s*(?:get|fetch|read|show|list|summari[sz]e)\b/.test(lower) &&
+    /\b(?:issue|issues|github|repo|repository|pull request|pull requests)\b/.test(lower) &&
+    (/\b(?:don'?t|do not|without|no)\s+(?:write|create|make|export|append|put|save)\b/.test(lower) ||
+      !/\b(?:sheet|spreadsheet|table|csv)\b/.test(lower))
+  );
+}
+
+function filterRouteForPromptConstraints(route: RouteToolsResult, prompt: string, catalog: ToolCatalogEntry[]) {
+  if (
+    !isReadOnlyAgainstSheetWorkflow(prompt) ||
+    (!route.intentIds?.includes("github.issues_to_sheet") && !route.slugs.some((slug) => slug.startsWith("GITHUB_")))
+  ) {
+    return route;
+  }
+
+  const allowed = new Set(catalog.map((tool) => tool.slug));
+  const readIntent = ROUTER_INTENTS.find((intent) => intent.id === "github.issues_read");
+  const slugs = (readIntent?.toolSlugs ?? [])
+    .filter((slug) => allowed.has(slug))
+    .filter((slug, index, all) => all.indexOf(slug) === index);
+
+  return {
+    ...route,
+    slugs,
+    intentIds: ["github.issues_read"],
+    rationale: `${route.rationale}; constrained to read-only by latest prompt`,
+  };
+}
+
+function validateLlmRoute(
+  raw: LlmToolRouteResult,
+  context: LlmRouteContext,
+  routingMode: "llm_first" | "shadow_llm"
+): RouteToolsResult {
+  const allowedSlugs = new Set(context.catalog.map((tool) => tool.slug));
+  const allowedSlugByUpper = new Map(context.catalog.map((tool) => [tool.slug.toUpperCase(), tool.slug]));
+  const intentById = new Map(ROUTER_INTENTS.map((intent) => [intent.id, intent]));
+  const droppedSlugs: string[] = [];
+  const droppedIntentIds: string[] = [];
+  const rawIntentIds = stringArray(raw.intentIds);
+  const rawToolSlugs = stringArray(raw.toolSlugs).map(
+    (slug) => allowedSlugByUpper.get(slug.toUpperCase()) ?? slug
+  );
+
+  const mutationAllowed =
+    Boolean(raw.isContinuation && context.activeTask?.selectedTools.some(isMutatingToolSlug)) ||
+    isExplicitMutationPrompt(context.prompt);
+
+  const intentIds = rawIntentIds
+    .filter((intentId, index, all) => all.indexOf(intentId) === index)
+    .filter((intentId) => {
+      const intent = intentById.get(intentId);
+      const valid = Boolean(
+        intent &&
+          intent.toolSlugs.some((slug) => allowedSlugs.has(slug)) &&
+          (!intent.mutating || mutationAllowed)
+      );
+      if (!valid) droppedIntentIds.push(intentId);
+      return valid;
+    })
+    .slice(0, context.maxIntents);
+
+  const selectedIntents = intentIds
+    .map((intentId) => intentById.get(intentId))
+    .filter((intent): intent is RouterIntent => Boolean(intent));
+
+  const intentSlugs = selectedIntents
+    .flatMap((intent) => intent.toolSlugs)
+    .filter((slug) => allowedSlugs.has(slug));
+
+  const llmSlugs = rawToolSlugs.filter((slug) => {
+    const valid = allowedSlugs.has(slug);
+    if (!valid) droppedSlugs.push(slug);
+    return valid;
+  });
+
+  const slugs = [...intentSlugs, ...llmSlugs]
+    .filter((slug) => !isMutatingToolSlug(slug) || mutationAllowed)
+    .filter((slug, index, all) => all.indexOf(slug) === index)
+    .slice(0, context.maxTools);
+
+  const rawHadSelections = rawIntentIds.length > 0 || rawToolSlugs.length > 0;
+  const allSelectionsDropped = rawHadSelections && intentIds.length === 0 && slugs.length === 0;
+  const onlyUnsupportedCapabilitySelections =
+    allSelectionsDropped &&
+    rawIntentIds.length === 0 &&
+    droppedSlugs.length > 0 &&
+    droppedSlugs.every((slug) => isUnsupportedCapabilitySlug(slug, context.catalog));
+  const confidence = allSelectionsDropped && !onlyUnsupportedCapabilitySelections ? 0 : clampConfidence(raw.confidence);
+  const rationaleParts = [
+    stringValue(raw.rationale) || "LLM-first route",
+    droppedIntentIds.length ? `dropped unknown intents: ${droppedIntentIds.join(", ")}` : "",
+    droppedSlugs.length ? `dropped unknown tools: ${droppedSlugs.join(", ")}` : "",
+  ].filter(Boolean);
+
+  return {
+    slugs,
+    rationale: rationaleParts.join("; "),
+    intentIds,
+    confidence,
+    routingMode,
+    scores: context.deterministic.scores ?? [],
+  };
+}
+
+function availableIntentSummaries(catalog: ToolCatalogEntry[]) {
+  const allowed = new Set(catalog.map((tool) => tool.slug));
+  return ROUTER_INTENTS.filter((intent) => intent.toolSlugs.some((slug) => allowed.has(slug))).map((intent) => ({
+    id: intent.id,
+    domain: intent.domain,
+    description: intent.description,
+    mutating: intent.mutating,
+    toolSlugs: intent.toolSlugs.filter((slug) => allowed.has(slug)),
+    examples: intent.examplePrompts.slice(0, 3),
+  }));
+}
+
+function candidateToolsForLlm(
+  prompt: string,
+  catalog: ToolCatalogEntry[],
+  scored: ScoredIntent[],
+  deterministic: RouteToolsResult
+) {
+  const bySlug = new Map(catalog.map((tool) => [tool.slug, tool]));
+  const ordered = [
+    ...(deterministic.slugs ?? []),
+    ...registryCoreSlugs(),
+    ...scored
+      .filter((entry) => entry.score >= LLM_CANDIDATE_SCORE)
+      .slice(0, 3)
+      .flatMap((entry) => entry.intent.toolSlugs),
+    ...rankCatalogByPrompt(prompt, catalog).map((entry) => entry.tool.slug),
+    ...catalog.map((tool) => tool.slug),
+  ];
+
+  const candidates: ToolCatalogEntry[] = [];
+  const seen = new Set<string>();
+  for (const slug of ordered) {
+    const tool = bySlug.get(slug);
+    if (!tool || seen.has(slug)) {
+      continue;
+    }
+    seen.add(slug);
+    candidates.push(tool);
+    if (candidates.length >= DISCOVERY_CANDIDATES) {
+      break;
+    }
+  }
+  return candidates;
+}
+
+function resolveRouterStrategy(options: RouteToolsOptions): RouterStrategy {
+  if (options.strategy) {
+    return options.strategy;
+  }
+  if (options.useLLM === false) {
+    return "deterministic";
+  }
+  const env = process.env.TOOL_ROUTER_STRATEGY?.toLowerCase();
+  if (env === "deterministic" || env === "shadow" || env === "llm_first") {
+    return env;
+  }
+  if (process.env.TOOL_ROUTER_USE_LLM === "0") {
+    return "deterministic";
+  }
+  return "llm_first";
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value
+        .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+        .map((item) => item.trim())
+    : [];
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function clampConfidence(value: unknown) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(numeric) ? Math.max(0, Math.min(1, numeric)) : 0;
+}
+
+function isExplicitMutationPrompt(prompt: string) {
+  if (isNegativeMutationPrompt(prompt)) {
+    return false;
+  }
+  const terms = termSet(prompt);
+  return hasAny(terms, MUTATION_TERMS);
+}
+
+function isNegativeMutationPrompt(prompt: string) {
+  return /\b(?:don'?t|do not|without|no)\s+(?:send|create|schedule|book|update|append|write|draft|reply|forward|delete|remove|post|make|export|save|put)\b/i.test(
+    prompt
+  );
+}
+
+function errorPreview(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.slice(0, 160);
+}
+
+function isUnsupportedCapabilitySlug(slug: string, catalog: ToolCatalogEntry[]) {
+  if (slug.startsWith("COMPOSIO_")) {
+    return false;
+  }
+  const prefix = slug.split("_")[0]?.toUpperCase();
+  if (!prefix) {
+    return false;
+  }
+  const sameToolkitTools = catalog.filter((tool) => tool.slug.split("_")[0]?.toUpperCase() === prefix);
+  if (sameToolkitTools.length === 0) {
+    return true;
+  }
+
+  const requestedActions = [...termSet(slug.replace(/^[A-Z0-9]+_/, "").replace(/_/g, " "))].filter((term) =>
+    UNSUPPORTED_CAPABILITY_ACTION_TERMS.has(term)
+  );
+  if (requestedActions.length === 0) {
+    return false;
+  }
+
+  const availableTerms = new Set<string>();
+  for (const tool of sameToolkitTools) {
+    const actionText = `${tool.slug.replace(/^[A-Z0-9]+_/, "").replace(/_/g, " ")} ${tool.description ?? ""}`;
+    termSet(actionText).forEach((term) => availableTerms.add(term));
+  }
+
+  return requestedActions.every((term) => !availableTerms.has(term));
 }
 
 async function refineWithLlm(
@@ -314,11 +1015,11 @@ export function rankCatalogByPrompt(prompt: string, catalog: ToolCatalogEntry[])
 
 async function loadCatalog(options: RouteToolsOptions) {
   if (options.catalog) {
-    return mergeFallbackCatalog(options.catalog);
+    return mergeFallbackCatalog(filterAllowedToolCatalog(options.catalog));
   }
 
   try {
-    return mergeFallbackCatalog(await getToolCatalog(options.forceRefreshCatalog ?? false));
+    return mergeFallbackCatalog(filterAllowedToolCatalog(await getToolCatalog(options.forceRefreshCatalog ?? false)));
   } catch {
     return FALLBACK_CATALOG;
   }
@@ -531,7 +1232,7 @@ function routeConfidence(topScore: number, nextScore: number) {
 }
 
 function mergeFallbackCatalog(catalog: ToolCatalogEntry[]) {
-  const bySlug = new Map(catalog.map((tool) => [tool.slug, tool]));
+  const bySlug = new Map(filterAllowedToolCatalog(catalog).map((tool) => [tool.slug, tool]));
   for (const tool of FALLBACK_CATALOG) {
     if (!bySlug.has(tool.slug)) {
       bySlug.set(tool.slug, tool);

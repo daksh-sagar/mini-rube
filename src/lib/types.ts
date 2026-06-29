@@ -7,9 +7,53 @@ export type ToolCatalogEntry = {
 export type RoutingMode =
   | "deterministic"
   | "llm_refined"
+  | "llm_first"
+  | "llm_first_fallback"
+  | "shadow_llm"
   | "catalog_llm"
   | "catalog_lexical"
   | "none";
+
+export type RouterStrategy = "llm_first" | "deterministic" | "shadow";
+
+export type RouterMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+export type ActiveRouteTask = {
+  intentId: string;
+  promptHistory: string[];
+  selectedTools: string[];
+};
+
+export type LlmToolRouteResult = {
+  intentIds?: unknown;
+  toolSlugs?: unknown;
+  isContinuation?: unknown;
+  missingSlots?: unknown;
+  confidence?: unknown;
+  rationale?: unknown;
+};
+
+export type LlmRouterInput = {
+  prompt: string;
+  messages: RouterMessage[];
+  activeTask?: ActiveRouteTask;
+  availableIntents: Array<{
+    id: string;
+    domain: string;
+    description: string;
+    mutating: boolean;
+    toolSlugs: string[];
+    examples: string[];
+  }>;
+  availableTools: ToolCatalogEntry[];
+  maxTools: number;
+  maxIntents: number;
+};
+
+export type LlmRouterFn = (input: LlmRouterInput) => Promise<LlmToolRouteResult>;
 
 export type RouteToolsResult = {
   slugs: string[];
@@ -17,6 +61,8 @@ export type RouteToolsResult = {
   intentIds?: string[];
   confidence?: number;
   routingMode?: RoutingMode;
+  routeScope?: "standalone" | "contextual_followup" | "ambiguous";
+  clarification?: string;
   scores?: Array<{ intentId: string; score: number }>;
 };
 
@@ -24,6 +70,10 @@ export type RouteToolsOptions = {
   catalog?: ToolCatalogEntry[];
   maxTools?: number;
   maxIntents?: number;
+  strategy?: RouterStrategy;
+  messages?: RouterMessage[];
+  activeTask?: ActiveRouteTask;
+  llmRouter?: LlmRouterFn;
   useLLM?: boolean;
   /**
    * Enables LLM/lexical discovery over the full catalog when the deterministic

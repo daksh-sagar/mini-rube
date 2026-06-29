@@ -578,8 +578,13 @@ function explicitGithubIssueLimit(input: WorkflowRunInput): number | undefined {
 
   const patterns = [
     /\b(?:last|latest|recent|newest|top|first|oldest|earliest)\s+(\d{1,4})\s+(?:open\s+|closed\s+|resolved\s+|unresolved\s+)?(?:github\s+|repo\s+|repository\s+)?issues?\b/,
-    /\b(\d{1,4})\s+(?:recent|latest|newest|last|oldest|earliest|top)\s+(?:open\s+|closed\s+|resolved\s+|unresolved\s+)?(?:github\s+|repo\s+|repository\s+)?issues?\b/,
-    /\b(?:fetch|get|list|read|show|write|export|summari[sz]e|make|create)\s+(?:the\s+)?(?:last|latest|recent|newest|oldest|earliest|top|first\s+)?(\d{1,4})\s+(?:recent\s+|latest\s+|newest\s+|open\s+|closed\s+|resolved\s+|unresolved\s+)*(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+    /\b(\d{1,4})\s+(?:most\s+recent|recent|latest|newest|last|oldest|earliest|top)\s+(?:open\s+|closed\s+|resolved\s+|unresolved\s+)?(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+    /\b(?:up to|at most|no more than|limit(?:ed)? to)\s+(\d{1,4})\s+(?:open\s+|closed\s+|resolved\s+|unresolved\s+)?(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+    /\b(?:fetch|get|list|read|show|write|export|summari[sz]e|make|create)\s+(?:the\s+)?(?:(?:exactly|only|just|up to|at most|no more than|limit(?:ed)? to|first|latest|recent|newest|top|oldest|earliest)\s+)?(\d{1,4})\s+(?:open\s+(?:and|&)\s+closed|closed\s+(?:and|&)\s+open|open\/closed|all)\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+    /\b(\d{1,4})\s+(?:open\s+(?:and|&)\s+closed|closed\s+(?:and|&)\s+open|open\/closed|all)\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+    /\b(\d{1,4})\s+(?:github\s+|repo\s+|repository\s+)?issues?\s+(?:open\s+(?:and|&)\s+closed|closed\s+(?:and|&)\s+open|open\/closed|all)\b/,
+    /\b(?:fetch|get|list|read|show|write|export|summari[sz]e|make|create)\s+(?:the\s+)?(?:(?:exactly|only|just|up to|at most|no more than|limit(?:ed)? to|last|latest|recent|newest|oldest|earliest|top|first)\s+)?(\d{1,4})\s+(?:recent\s+|latest\s+|newest\s+|open\s+|closed\s+|resolved\s+|unresolved\s+)*(?:github\s+|repo\s+|repository\s+)?issues?\b/,
+    /\b(?:github\s+|repo\s+|repository\s+)?issues?\b.{0,40}\blimit(?:ed)?(?:\s+to)?\s+(\d{1,4})\b/,
     /\b(\d{1,4})\s+(?:open\s+|closed\s+|resolved\s+|unresolved\s+)?(?:github\s+|repo\s+|repository\s+)?issues?\b/,
   ];
 
@@ -610,10 +615,12 @@ function explicitResumeLimit(input: WorkflowRunInput): number | undefined {
   }
 
   const patterns = [
-    /\b(?:first|last|latest|recent|newest|oldest|top)\s+(\d{1,4})\s+(?:resume|resumes|candidate\s+documents?|pdfs?|files?)\b/,
-    /\b(\d{1,4})\s+(?:recent|latest|newest|last|oldest|first|top)\s+(?:resume|resumes|candidate\s+documents?|pdfs?|files?)\b/,
-    /\b(?:take|fetch|download|get|parse|extract|process|read|list|write|export|make|create)\s+(?:the\s+)?(?:(?:exactly|only|just|first|last|latest|recent|newest|oldest|top)\s+)?(\d{1,4})\s+(?:resume|resumes|candidate\s+documents?|pdfs?|files?)\b/,
-    /\b(\d{1,4})\s+(?:resume|resumes|candidate\s+documents?|pdfs?)\b/,
+    /\b(?:first|last|latest|recent|newest|oldest|top)\s+(\d{1,4})\s+(?:candidate\s+resumes?|resumes?|cvs?|candidate\s+documents?|pdf\s+files?|pdfs?|files?)\b/,
+    /\b(\d{1,4})\s+(?:most\s+recent|recent|latest|newest|last|oldest|first|top)\s+(?:candidate\s+resumes?|resumes?|cvs?|candidate\s+documents?|pdf\s+files?|pdfs?|files?)\b/,
+    /\b(?:up to|at most|no more than|limit(?:ed)? to)\s+(\d{1,4})\s+(?:candidate\s+resumes?|resumes?|cvs?|candidate\s+documents?|pdf\s+files?|pdfs?|files?)\b/,
+    /\b(?:take|fetch|download|get|parse|extract|process|read|list|write|export|make|create)\s+(?:the\s+)?(?:(?:exactly|only|just|up to|at most|no more than|limit(?:ed)? to|first|last|latest|recent|newest|oldest|top)\s+)?(\d{1,4})\s+(?:candidate\s+resumes?|resumes?|cvs?|candidate\s+documents?|pdf\s+files?|pdfs?|files?)\b/,
+    /\b(?:candidate\s+resumes?|resumes?|cvs?|candidate\s+documents?|pdf\s+files?|pdfs?|files?)\b.{0,40}\blimit(?:ed)?(?:\s+to)?\s+(\d{1,4})\b/,
+    /\b(\d{1,4})\s+(?:candidate\s+resumes?|resumes?|cvs?|candidate\s+documents?|pdf\s+files?|pdfs?)\b/,
   ];
 
   for (const pattern of patterns) {
