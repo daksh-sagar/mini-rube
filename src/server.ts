@@ -15,9 +15,17 @@ import {
   getToolInputSchema,
   getToolSlug,
   loadToolSchemas,
+  toolkitForToolSlug,
   supportedToolkits,
   supportedToolSlugs,
 } from "./lib/tool-catalog";
+import {
+  allowedMutatingToolSlugs,
+  exposedToolSlugsForChat,
+  isMutatingToolAllowedForRoute,
+  resolveChatToolSelectionMode,
+  routeAllowsMutation,
+} from "./lib/tool-selection";
 import { routeToolsForPrompt } from "./lib/router";
 import { DEFAULT_CALENDAR_TIMEZONE, parseCalendarEventDraft, type CalendarEventDraft } from "./lib/calendar-intent";
 import { createSqliteWorkflowStore, type WorkflowJob } from "./lib/job-store";
@@ -417,12 +425,8 @@ const TOOLKIT_LABELS: Record<string, string> = {
   github: "GitHub",
 };
 
-// Derive the owning toolkit from a tool slug's prefix (e.g. GITHUB_GET_AN_ISSUE
-// -> "github") and validate it against the configured auth configs. This keeps
-// connection gating generic instead of hardcoding GOOGLESUPER_/GITHUB_ checks.
 function toolkitForSlug(slug: string): string | undefined {
-  const prefix = slug.split("_")[0]?.toLowerCase();
-  return prefix && prefix in AUTH_CONFIGS ? prefix : undefined;
+  return toolkitForToolSlug(slug);
 }
 
 function requiredToolkitsForSlugs(slugs: string[]): string[] {
@@ -1506,7 +1510,12 @@ async function executeToolWithRecovery(
 
 function makeAITools(
   toolSchemas: ComposioToolSchema[],
-  options: { userId: string; run: RunState; files: UploadedFileRef[] }
+  options: {
+    userId: string;
+    run: RunState;
+    files: UploadedFileRef[];
+    route: Pick<RouteToolsResult, "slugs">;
+  }
 ) {
   const aiTools: Record<string, any> = {};
 
@@ -1529,6 +1538,21 @@ function makeAITools(
         console.log(`[tool] ${slug}`, args);
 
         if (isMutatingToolSlug(slug)) {
+          if (!isMutatingToolAllowedForRoute(slug, options.route)) {
+            addTrace(options.run, {
+              type: "info",
+              title: "Blocked unrequested mutation",
+              detail: "The model tried to call a mutating tool that was not authorized by the latest request route.",
+              toolSlug: slug,
+              args,
+            });
+            return {
+              blocked: true,
+              reason:
+                "This mutating tool was available for discovery but was not authorized for the user's latest request. Do not ask for confirmation or claim anything is pending. Answer the latest read-only request, or ask a concise clarification if the user wants a write action.",
+            };
+          }
+
           const pendingAction = createPendingAction(options.userId, options.run, slug, args);
           return {
             needsConfirmation: true,
@@ -2192,9 +2216,15 @@ Bun.serve({
           return makeLocalTextResponse(unsupportedNoToolActionText(), run.id, routeResponseHeaders);
         }
 
+        let connectionStatuses: Record<string, boolean> | null = null;
+        const getConnections = async () => {
+          connectionStatuses ??= await getConnectionStatuses(userId);
+          return connectionStatuses;
+        };
+
         const requiredToolkits = requiredToolkitsForSlugs(route.slugs);
         if (requiredToolkits.length) {
-          const connections = await getConnectionStatuses(userId);
+          const connections = await getConnections();
           const missingToolkits = requiredToolkits.filter((toolkit) => !connections[toolkit]);
 
           if (missingToolkits.length) {
@@ -2260,19 +2290,40 @@ Bun.serve({
           return emailDraftResponse(userId, prompt, route, emailDraft, routeResponseHeaders);
         }
 
-        const toolSchemas = await loadToolSchemas(route.slugs);
-        if (route.slugs.length > 0 && toolSchemas.length === 0) {
+        const toolSelectionMode = resolveChatToolSelectionMode();
+        const connections = toolSelectionMode === "all_connected" ? await getConnections() : {};
+        const exposedSlugs = exposedToolSlugsForChat(route, connections, toolSelectionMode);
+        const toolSchemas = await loadToolSchemas(exposedSlugs);
+        const loadedToolSlugs = toolSchemas.map(getToolSlug).filter(Boolean);
+        const loadedToolSlugSet = new Set(loadedToolSlugs);
+        const missingRouteSlugs = route.slugs.filter((slug) => !loadedToolSlugSet.has(slug));
+        const schemaFailureSlugs =
+          missingRouteSlugs.length > 0 ? missingRouteSlugs : exposedSlugs.length > 0 && toolSchemas.length === 0 ? exposedSlugs : [];
+        if (schemaFailureSlugs.length > 0) {
           const run = createRun(userId, prompt, route.slugs, "tool schema load failed");
           run.status = "completed";
           addTrace(run, {
             type: "error",
             title: "Selected tool schemas unavailable",
-            detail: route.slugs.join(", "),
+            detail: schemaFailureSlugs.join(", "),
           });
-          return makeLocalTextResponse(missingToolSchemaText(route, run.id), run.id, routeResponseHeaders);
+          return makeLocalTextResponse(
+            missingToolSchemaText({ slugs: schemaFailureSlugs }, run.id),
+            run.id,
+            routeResponseHeaders
+          );
         }
         const runPrompt = effectiveRunPrompt(messages, prompt, route);
-        const run = createRun(userId, runPrompt, toolSchemas.map(getToolSlug).filter(Boolean), route.rationale);
+        const run = createRun(userId, runPrompt, route.slugs, route.rationale);
+        if (toolSelectionMode === "all_connected") {
+          addTrace(run, {
+            type: "info",
+            title: "Available connected tools",
+            detail: route.slugs.length
+              ? `Route selected ${route.slugs.join(", ")}; exposed ${loadedToolSlugs.join(", ")}.`
+              : `No route-specific tools were selected; exposed ${loadedToolSlugs.join(", ")}.`,
+          });
+        }
 
         if (files.length) {
           addTrace(run, {
@@ -2299,14 +2350,22 @@ Bun.serve({
         // Also reinforce the attachment fact inside the conversation (see helper).
         const messagesForModel = files.length ? appendAttachmentNote(messages, attachedNames) : messages;
 
-        const toolsForRequest = run.selectedTools.length ? run.selectedTools.join(", ") : "(none for this request)";
+        const toolsForRequest = loadedToolSlugs.length ? loadedToolSlugs.join(", ") : "(none for this request)";
+        const routedTools = route.slugs.length ? route.slugs.join(", ") : "(none)";
+        const allowedWrites = allowedMutatingToolSlugs(route);
+        const mutationPolicy = routeAllowsMutation(route)
+          ? `Mutating tools authorized for this latest request: ${allowedWrites.join(", ") || "(none)"}. Do not call any other mutating tool.`
+          : "This latest request is not authorized for external mutations. Do not call send/create/update/append/write tools; answer with reads or ask a concise clarification.";
         const system = `You are Mini Rube, a general agent that acts through Composio direct tools.
 
 Current date: ${currentDate}. Treat relative dates like "tomorrow" from this date unless the user specifies otherwise.
 
 SCOPE — you can ONLY act through the services connected via Composio: Google (Gmail, Google Calendar, Google Drive, Google Sheets) and GitHub. You have NO access to Slack, Notion, Microsoft/Teams, Linear, or any other service. If the user asks for something you have no tool for (e.g. "send a Slack message"), tell them plainly you can't do that and briefly note what you can do (Google and GitHub) — never claim or pretend to do it, and never invent a tool you don't have.
 
-You have only the selected tools for this request: ${toolsForRequest}.
+Available tools for this turn: ${toolsForRequest}.
+Routing hint for the latest user request: ${routedTools}.
+${mutationPolicy}
+The latest user message is authoritative. Prior conversation can fill missing details, but it must not override the latest message's task, domain, quantity, or read/write intent.
 Do not mention unavailable tools. Do not use or request COMPOSIO_* meta tools.${filesNote}
 
 Format answers in Markdown: use short paragraphs, bullet lists for multiple items, and Markdown links for any URLs (sheets, docs, issues).
@@ -2325,7 +2384,7 @@ When you resolve a person's email from their name (e.g. scheduling a calendar ev
           model: agentModel(AGENT_MODEL),
           system,
           messages: messagesForModel,
-          tools: makeAITools(toolSchemas, { userId, run, files }),
+          tools: makeAITools(toolSchemas, { userId, run, files, route }),
           maxSteps: 25,
           maxTokens: AGENT_MAX_TOKENS,
           temperature: 0.2,

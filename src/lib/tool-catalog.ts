@@ -25,6 +25,7 @@ const INTERNAL_WORKFLOW_TOOL_SLUGS = [
   // Workflows read the created sheet's header row before appending later rows.
   "GOOGLESUPER_GET_BATCH_VALUES",
 ];
+const CHAT_EXCLUDED_TOOL_SLUGS = new Set(INTERNAL_WORKFLOW_TOOL_SLUGS);
 
 const SUPPORTED_TOOL_SLUGS = new Set([
   ...ROUTER_INTENTS.flatMap((intent) => intent.toolSlugs),
@@ -65,6 +66,49 @@ export const listComposioToolCatalog = getToolCatalog;
 
 export function supportedToolSlugs() {
   return [...SUPPORTED_TOOL_SLUGS].sort();
+}
+
+export function toolkitForToolSlug(slug: string): string | undefined {
+  const prefix = slug.split("_")[0]?.toLowerCase();
+  return prefix && supportedToolkits().some((toolkit) => toolkit.toLowerCase() === prefix)
+    ? prefix
+    : undefined;
+}
+
+export function supportedToolSlugsForToolkits(toolkits: string[]) {
+  const allowedToolkits = new Set(toolkits.map((toolkit) => toolkit.toLowerCase()));
+  return supportedToolSlugs().filter((slug) => {
+    const toolkit = toolkitForToolSlug(slug);
+    return toolkit ? allowedToolkits.has(toolkit) : false;
+  });
+}
+
+export function supportedToolSlugsForConnections(connections: Record<string, boolean>) {
+  return supportedToolSlugsForToolkits(
+    Object.entries(connections)
+      .filter(([, connected]) => connected)
+      .map(([toolkit]) => toolkit)
+  );
+}
+
+export function chatToolSlugs() {
+  return supportedToolSlugs().filter((slug) => !CHAT_EXCLUDED_TOOL_SLUGS.has(slug));
+}
+
+export function chatToolSlugsForToolkits(toolkits: string[]) {
+  const allowedToolkits = new Set(toolkits.map((toolkit) => toolkit.toLowerCase()));
+  return chatToolSlugs().filter((slug) => {
+    const toolkit = toolkitForToolSlug(slug);
+    return toolkit ? allowedToolkits.has(toolkit) : false;
+  });
+}
+
+export function chatToolSlugsForConnections(connections: Record<string, boolean>) {
+  return chatToolSlugsForToolkits(
+    Object.entries(connections)
+      .filter(([, connected]) => connected)
+      .map(([toolkit]) => toolkit)
+  );
 }
 
 export function filterAllowedToolCatalog(catalog: ToolCatalogEntry[]) {
@@ -166,8 +210,8 @@ export function isAllowedToolSlug(slug: string, toolkit?: string) {
   if (!SUPPORTED_TOOL_SLUGS.has(normalizedSlug)) {
     return false;
   }
-  // A slug's toolkit is its first segment (GOOGLESUPER_… → googlesuper).
-  const slugToolkit = normalizedSlug.split("_")[0]?.toLowerCase();
+  // A slug's toolkit is its first segment (GOOGLESUPER_... -> googlesuper).
+  const slugToolkit = toolkitForToolSlug(normalizedSlug);
   if (!slugToolkit) {
     return false;
   }

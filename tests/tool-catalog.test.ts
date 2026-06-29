@@ -4,9 +4,17 @@ process.env.COMPOSIO_API_KEY ??= "test";
 process.env.GOOGLESUPER_AUTH_CONFIG_ID ??= "test";
 process.env.GITHUB_AUTH_CONFIG_ID ??= "test";
 
-const { filterAllowedToolCatalog, getToolInputSchema, getToolSlug, isAllowedToolSlug, supportedToolSlugs } = await import(
-  "../src/lib/tool-catalog"
-);
+const {
+  filterAllowedToolCatalog,
+  getToolInputSchema,
+  getToolSlug,
+  isAllowedToolSlug,
+  chatToolSlugsForConnections,
+  supportedToolSlugs,
+  supportedToolSlugsForConnections,
+  supportedToolSlugsForToolkits,
+  toolkitForToolSlug,
+} = await import("../src/lib/tool-catalog");
 
 describe("tool-catalog helpers", () => {
   test("rejects meta tools and toolkit mismatches", () => {
@@ -31,6 +39,28 @@ describe("tool-catalog helpers", () => {
 
     expect(filtered.map((tool) => tool.slug)).toEqual(["GOOGLESUPER_FETCH_EMAILS"]);
     expect(supportedToolSlugs()).toContain("GOOGLESUPER_GET_BATCH_VALUES");
+  });
+
+  test("derives supported tool slugs from connected toolkits", () => {
+    expect(toolkitForToolSlug("GOOGLESUPER_FETCH_EMAILS")).toBe("googlesuper");
+    expect(toolkitForToolSlug("GITHUB_LIST_REPOSITORY_ISSUES")).toBe("github");
+    expect(supportedToolSlugsForToolkits(["github"])).toEqual([
+      "GITHUB_GET_AN_ISSUE",
+      "GITHUB_LIST_REPOSITORY_ISSUES",
+      "GITHUB_SEARCH_ISSUES_AND_PULL_REQUESTS",
+    ]);
+
+    const googleOnly = supportedToolSlugsForConnections({ googlesuper: true, github: false });
+    expect(googleOnly).toContain("GOOGLESUPER_FETCH_EMAILS");
+    expect(googleOnly).toContain("GOOGLESUPER_CREATE_EVENT");
+    expect(googleOnly).toContain("GOOGLESUPER_SHEET_FROM_JSON");
+    expect(googleOnly.some((slug) => slug.startsWith("GITHUB_"))).toBe(false);
+  });
+
+  test("excludes workflow-only internal tools from chat exposure", () => {
+    const chatTools = chatToolSlugsForConnections({ googlesuper: true, github: true });
+    expect(supportedToolSlugs()).toContain("GOOGLESUPER_GET_BATCH_VALUES");
+    expect(chatTools).not.toContain("GOOGLESUPER_GET_BATCH_VALUES");
   });
 
   test("documents the exact Mini Rube supported tool surface", () => {
