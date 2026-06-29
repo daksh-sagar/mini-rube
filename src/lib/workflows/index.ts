@@ -571,7 +571,7 @@ function explicitGithubIssueLimit(input: WorkflowRunInput): number | undefined {
   }
 
   const patterns = [
-    /\b(?:last|latest|recent|newest|top|first|oldest|earliest)\s+(\d{1,4})\b/,
+    /\b(?:last|latest|recent|newest|top|first|oldest|earliest)\s+(\d{1,4})\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
     /\b(\d{1,4})\s+(?:recent|latest|newest|last|oldest|earliest|top)\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
     /\b(?:fetch|get|list|read|show|write|export|summari[sz]e|make|create)\s+(?:the\s+)?(?:last|latest|recent|newest|oldest|earliest|top|first\s+)?(\d{1,4})\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
     /\b(\d{1,4})\s+(?:github\s+|repo\s+|repository\s+)?issues?\b/,
