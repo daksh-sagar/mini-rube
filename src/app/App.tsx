@@ -538,22 +538,26 @@ function readJob(payload: unknown): WorkflowJob | null {
       })
     : [];
 
+  const status = getString(jobObj.status) ?? "unknown";
+  const rawPhase =
+    getString(jobObj.phase) ??
+    getString(jobObj.currentPhase) ??
+    getString(jobObj.current_phase) ??
+    getString(progress?.phase) ??
+    undefined;
+
   return {
     id,
     userId: getString(jobObj.userId) ?? getString(jobObj.user_id) ?? "",
     type: getString(jobObj.type) ?? "workflow",
-    status: getString(jobObj.status) ?? "unknown",
+    status,
     approvalStatus:
       getString(jobObj.approvalStatus) ??
       getString(jobObj.approval_status) ??
       "unknown",
     approvalSummary:
       getString(jobObj.approvalSummary) ?? getString(jobObj.approval_summary) ?? undefined,
-    phase:
-      getString(jobObj.phase) ??
-      getString(jobObj.currentPhase) ??
-      getString(jobObj.current_phase) ??
-      undefined,
+    phase: getJobPhaseForDisplay(status, rawPhase),
     progress: {
       totalItems: getNumber(progress?.totalItems ?? progress?.total_items) ?? 0,
       fetchedItems: getNumber(progress?.fetchedItems ?? progress?.fetched_items) ?? 0,
@@ -573,6 +577,22 @@ function normalizeJobValue(value: string | undefined) {
   return value?.trim().toLowerCase() ?? "";
 }
 
+function getTerminalJobPhase(status: string | undefined) {
+  const normalized = normalizeJobValue(status);
+  if (normalized === "cancelled" || normalized === "canceled") return "cancelled";
+  if (normalized === "completed" || normalized === "succeeded") return "completed";
+  if (normalized === "failed") return "failed";
+  return null;
+}
+
+function getJobPhaseForDisplay(status: string | undefined, phase: string | undefined) {
+  return getTerminalJobPhase(status) ?? phase;
+}
+
+function getJobDisplayPhase(job: WorkflowJob | null) {
+  return getJobPhaseForDisplay(job?.status, job?.phase);
+}
+
 function shouldPollJob(job: WorkflowJob | null) {
   return ["queued", "running", "waiting_confirmation"].includes(
     normalizeJobValue(job?.status)
@@ -586,9 +606,7 @@ function canCancelJob(job: WorkflowJob | null) {
 }
 
 function isTerminalJob(job: WorkflowJob | null) {
-  return ["cancelled", "canceled", "failed", "completed", "succeeded"].includes(
-    normalizeJobValue(job?.status)
-  );
+  return getTerminalJobPhase(job?.status) !== null;
 }
 
 function jobNeedsConfirmation(job: WorkflowJob | null) {
@@ -629,11 +647,11 @@ const ACTIVE_WORK_PHASES = new Set(["parsing", "writing"]);
 const READY_TO_WRITE_PHASES = new Set(["approval", "waiting_confirmation"]);
 
 function isJobInDiscovery(job: WorkflowJob | null) {
-  return DISCOVERY_PHASES.has(normalizeJobValue(job?.phase));
+  return !isTerminalJob(job) && DISCOVERY_PHASES.has(normalizeJobValue(getJobDisplayPhase(job)));
 }
 
 function isJobReadyToWrite(job: WorkflowJob | null) {
-  return READY_TO_WRITE_PHASES.has(normalizeJobValue(job?.phase));
+  return !isTerminalJob(job) && READY_TO_WRITE_PHASES.has(normalizeJobValue(getJobDisplayPhase(job)));
 }
 
 function getJobProgressPercent(job: WorkflowJob | null) {
@@ -645,7 +663,7 @@ function getJobProgressPercent(job: WorkflowJob | null) {
   // Track whichever counter actually advances in the current phase. During writing,
   // processedItems is pinned at the total while writtenRows climbs, so writtenRows is
   // the honest numerator; during parsing/other phases processedItems is what grows.
-  const phase = normalizeJobValue(job.phase);
+  const phase = normalizeJobValue(getJobDisplayPhase(job));
   const completed =
     phase === "writing" ? job.progress.writtenRows : job.progress.processedItems;
   const bounded = Math.min(Math.max(completed, 0), job.progress.totalItems);
@@ -1506,7 +1524,7 @@ export default function App() {
         setJobState("ready");
       } else {
         setJob((current) =>
-          current && current.id === jobId ? { ...current, status: "cancelled" } : current
+          current && current.id === jobId ? { ...current, status: "cancelled", phase: "cancelled" } : current
         );
         setJobRefresh((value) => value + 1);
       }
@@ -1626,13 +1644,14 @@ export default function App() {
   const jobProgressPercent = getJobProgressPercent(job);
   const jobInDiscovery = isJobInDiscovery(job);
   const jobReadyToWrite = isJobReadyToWrite(job);
+  const jobDisplayPhase = getJobDisplayPhase(job);
   const formattedJobUpdatedAt = formatJobDate(job?.updatedAt);
   const canConfirmJob = jobNeedsConfirmation(job);
   // Only treat the job as awaiting approval when it isn't already doing active work.
   // Guards against the brief poll window where status can lag behind the phase right
   // after the user confirms (phase flips to writing before the next status refresh).
   const showJobConfirmation =
-    jobHasConfirmationRequest(job) && !ACTIVE_WORK_PHASES.has(normalizeJobValue(job?.phase));
+    canConfirmJob && !ACTIVE_WORK_PHASES.has(normalizeJobValue(jobDisplayPhase));
   const firstPendingAction = pendingActions[0];
   const primaryApproval: PrimaryApproval | null = showJobConfirmation && job
     ? {
@@ -2001,10 +2020,10 @@ export default function App() {
                       <span>Approval</span>
                       <strong>{job.approvalStatus}</strong>
                     </div>
-                    {job.phase && (
+                    {jobDisplayPhase && (
                       <div>
                         <span>Phase</span>
-                        <strong>{job.phase}</strong>
+                        <strong>{jobDisplayPhase}</strong>
                       </div>
                     )}
                     {formattedJobUpdatedAt && (

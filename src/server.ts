@@ -718,6 +718,7 @@ async function maybeResumeWorkflowFromFollowup(
 function jobResponse(job: WorkflowJob) {
   const output = isRecord(job.output) ? job.output : {};
   const progress = isRecord(job.progress) ? job.progress : {};
+  const phase = workflowPhaseForResponse(job, progress);
   const artifacts = normalizeArtifacts(output.artifacts);
   const approval = workflowApprovals.get(job.id);
   return {
@@ -725,7 +726,7 @@ function jobResponse(job: WorkflowJob) {
     userId: job.userId,
     type: job.workflowId,
     status: job.status,
-    phase: typeof progress.phase === "string" ? progress.phase : job.status,
+    phase,
     approvalStatus: approval
       ? "waiting_confirmation"
       : job.status === "waiting_confirmation"
@@ -737,7 +738,7 @@ function jobResponse(job: WorkflowJob) {
           : "not_required",
     approvalSummary: approval?.request.summary ?? (typeof progress.pendingSummary === "string" ? progress.pendingSummary : undefined),
     progress: {
-      phase: typeof progress.phase === "string" ? progress.phase : job.status,
+      phase,
       totalItems: toNumber(progress.totalItems) ?? 0,
       fetchedItems: toNumber(progress.fetchedItems) ?? 0,
       processedItems: toNumber(progress.processedItems) ?? 0,
@@ -748,6 +749,13 @@ function jobResponse(job: WorkflowJob) {
     error: job.error,
     updatedAt: job.updatedAt,
   };
+}
+
+function workflowPhaseForResponse(job: WorkflowJob, progress: Record<string, unknown>) {
+  if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
+    return job.status;
+  }
+  return typeof progress.phase === "string" ? progress.phase : job.status;
 }
 
 function normalizeArtifacts(value: unknown): WorkflowArtifact[] {

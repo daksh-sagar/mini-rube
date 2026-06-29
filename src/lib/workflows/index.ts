@@ -612,7 +612,7 @@ function explicitResumeLimit(input: WorkflowRunInput): number | undefined {
   const patterns = [
     /\b(?:first|last|latest|recent|newest|oldest|top)\s+(\d{1,4})\s+(?:resume|resumes|candidate\s+documents?|pdfs?|files?)\b/,
     /\b(\d{1,4})\s+(?:recent|latest|newest|last|oldest|first|top)\s+(?:resume|resumes|candidate\s+documents?|pdfs?|files?)\b/,
-    /\b(?:take|parse|extract|process|read|list|write|export|make|create)\s+(?:the\s+)?(?:first|last|latest|recent|newest|oldest|top\s+)?(\d{1,4})\s+(?:resume|resumes|candidate\s+documents?|pdfs?|files?)\b/,
+    /\b(?:take|fetch|download|get|parse|extract|process|read|list|write|export|make|create)\s+(?:the\s+)?(?:first|last|latest|recent|newest|oldest|top\s+)?(\d{1,4})\s+(?:resume|resumes|candidate\s+documents?|pdfs?|files?)\b/,
     /\b(\d{1,4})\s+(?:resume|resumes|candidate\s+documents?|pdfs?)\b/,
   ];
 
