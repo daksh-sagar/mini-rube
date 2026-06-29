@@ -128,6 +128,49 @@ describe("parseCalendarEventDraft", () => {
     });
   });
 
+  test("uses timezone supplied as a later follow-up", () => {
+    const draft = parseCalendarEventDraft(
+      [
+        "schedule an event with person@example.com on 2026-06-30 at 13:00 titled Planning",
+        "UTC",
+      ].join("\n"),
+      { now: NOW, timeZone: "Asia/Kolkata" }
+    );
+
+    expect(draft?.args).toMatchObject({
+      timezone: "UTC",
+      start_datetime: "2026-06-30T13:00:00",
+    });
+  });
+
+  test("normalizes common timezone aliases", () => {
+    const draft = parseCalendarEventDraft(
+      "person@example.com, 2026-06-30 13:00, Planning, IST",
+      { now: NOW, timeZone: "UTC" }
+    );
+
+    expect(draft?.args.timezone).toBe("Asia/Kolkata");
+  });
+
+  test("does not use a timezone-only follow-up as the event title", () => {
+    const draft = parseCalendarEventDraft(
+      [
+        "send a calendar invite to Daksh",
+        "Daksh Sagar",
+        "tomorrow, 1 pm, Test, 30 mins",
+        "IST",
+        "daksh.iitmandi@gmail.com",
+      ].join("\n"),
+      { now: NOW, timeZone: "Asia/Kolkata" }
+    );
+
+    expect(draft?.args).toMatchObject({
+      summary: "Test",
+      timezone: "Asia/Kolkata",
+      start_datetime: "2026-06-30T13:00:00",
+    });
+  });
+
   test("does not draft an event without complete concrete details", () => {
     expect(
       parseCalendarEventDraft("tomorrow 7pm, TEST EVENT, 30 mins", {

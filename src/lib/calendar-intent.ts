@@ -61,7 +61,8 @@ export function parseCalendarEventDraft(
   const attendee = lastMatch(source, EMAIL_PATTERN)?.[0];
   if (!attendee) return null;
 
-  const start = parseStart(source, options);
+  const timezone = parseTimeZone(source) ?? options.timeZone ?? DEFAULT_CALENDAR_TIMEZONE;
+  const start = parseStart(source, { ...options, timeZone: timezone });
   if (!start) return null;
 
   const duration = parseDurationMinutes(source) ?? 30;
@@ -79,7 +80,7 @@ export function parseCalendarEventDraft(
       summary,
       attendees: [attendee],
       start_datetime: start.iso,
-      timezone: options.timeZone ?? DEFAULT_CALENDAR_TIMEZONE,
+      timezone,
       calendar_id: "primary",
       event_duration_hour: Math.floor(duration / 60),
       event_duration_minutes: duration % 60,
@@ -199,6 +200,58 @@ function parseDurationSegmentMinutes(segment: string) {
   return found ? total : null;
 }
 
+function parseTimeZone(prompt: string) {
+  const explicit = lastMatch(prompt, /\b([A-Za-z]+\/[A-Za-z_]+(?:\/[A-Za-z_]+)?)\b/g)?.[1];
+  if (explicit && isValidTimeZone(explicit)) {
+    return explicit;
+  }
+
+  const alias = lastMatch(
+    prompt,
+    /\b(IST|India(?:n)? Standard Time|UTC|GMT|ET|EST|EDT|PT|PST|PDT|CT|CST|CDT|MT|MST|MDT)\b/gi
+  )?.[1];
+  if (!alias) {
+    return null;
+  }
+
+  switch (alias.toLowerCase()) {
+    case "ist":
+    case "india standard time":
+    case "indian standard time":
+      return "Asia/Kolkata";
+    case "utc":
+    case "gmt":
+      return "UTC";
+    case "et":
+    case "est":
+    case "edt":
+      return "America/New_York";
+    case "pt":
+    case "pst":
+    case "pdt":
+      return "America/Los_Angeles";
+    case "ct":
+    case "cst":
+    case "cdt":
+      return "America/Chicago";
+    case "mt":
+    case "mst":
+    case "mdt":
+      return "America/Denver";
+    default:
+      return null;
+  }
+}
+
+function isValidTimeZone(value: string) {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function parseSummary(
   prompt: string,
   context: { attendee: string; dateText: string; timeText: string }
@@ -222,6 +275,7 @@ function parseSummary(
     if (part.toLowerCase().includes(context.dateText.toLowerCase())) continue;
     if (part.toLowerCase().includes(context.timeText.toLowerCase())) continue;
     if (parseDurationMinutes(part) != null) continue;
+    if (parseTimeZone(part) != null) continue;
     if (isSchedulingCommandPart(part)) continue;
 
     const summary = cleanSummary(part);

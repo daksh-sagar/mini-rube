@@ -1037,9 +1037,41 @@ function isLikelyCalendarFollowup(prompt: string) {
     /\b(?:1[0-2]|0?[1-9])(?::[0-5]\d)?\s*(?:am|pm)\b/i.test(text) ||
     /\b(?:[01]?\d|2[0-3]):[0-5]\d\b/.test(text) ||
     /\b\d+(?:\.\d+)?\s*-?\s*(?:hours?|hrs?|hr|h|minutes?|mins?|min|m)\b/i.test(text) ||
+    isCalendarTimezoneReply(text) ||
     /\b(?:title|titled|called|named|duration|email)\b/i.test(text) ||
     (text.length <= 160 && text.includes(","))
   );
+}
+
+function isCalendarTimezoneReply(prompt: string) {
+  const text = prompt.trim();
+  if (/^(?:IST|India(?:n)? Standard Time|UTC|GMT|ET|EST|EDT|PT|PST|PDT|CT|CST|CDT|MT|MST|MDT)$/i.test(text)) {
+    return true;
+  }
+  return /^[A-Za-z]+\/[A-Za-z_]+(?:\/[A-Za-z_]+)?$/.test(text) && isValidCalendarTimeZone(text);
+}
+
+function isValidCalendarTimeZone(value: string) {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isShortCalendarDetailReply(prompt: string) {
+  const text = prompt.trim();
+  if (!text || text.length > 200) {
+    return false;
+  }
+  if (/^(?:thanks|thank you|cancel|stop|never mind|nevermind)$/i.test(text)) {
+    return false;
+  }
+  if (/https?:\/\/|[a-z0-9_.-]+\/[a-z0-9_.-]+/i.test(text) && !isCalendarTimezoneReply(text)) {
+    return false;
+  }
+  return true;
 }
 
 function looksLikeNewNonCalendarIntent(prompt: string) {
@@ -1090,7 +1122,7 @@ function activeCalendarTaskForFollowup(userId: string, messages: CoreMessage[], 
   if (looksLikeNewNonCalendarIntent(prompt)) {
     return null;
   }
-  if (!isLikelyCalendarFollowup(prompt)) {
+  if (!isLikelyCalendarFollowup(prompt) && !isShortCalendarDetailReply(prompt)) {
     return null;
   }
 
