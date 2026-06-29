@@ -322,6 +322,43 @@ describe("planned workflow execution", () => {
     expect(writtenRows.map((row) => row.fileId)).toEqual(resumes.map((resume) => resume.fileId));
   });
 
+  test("defaults Drive resume parsing to sequential work", async () => {
+    const resumes = makeResumeFiles(5);
+    let activeParses = 0;
+    let maxActiveParses = 0;
+
+    const service = await makeWorkflowService({
+      onToolCall: async (slug, args) => {
+        if (slug === "GOOGLESUPER_FIND_FILE" || slug === "GOOGLESUPER_LIST_CHILDREN_V2") {
+          return pageResult(resumes, args, "files");
+        }
+
+        if (slug === "GOOGLESUPER_PARSE_FILE") {
+          const fileId = stringArg(args, ["fileId", "file_id", "id"]);
+          activeParses += 1;
+          maxActiveParses = Math.max(maxActiveParses, activeParses);
+          await sleep(5);
+          activeParses -= 1;
+          return { text: `Candidate ${fileId}` };
+        }
+
+        if (isSheetWrite(slug)) {
+          return sheetWriteResult(rowsFromArgs(args).length);
+        }
+
+        throw new Error(`Unexpected tool call: ${slug}`);
+      },
+    });
+
+    const result = await service.runWorkflow(DRIVE_RESUMES_TO_SHEET, {
+      userId: "user_default_concurrency",
+      folderId: "drive_folder_default_concurrency",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(maxActiveParses).toBe(1);
+  });
+
   test("cancels Drive resume workflow before sheet writes", async () => {
     const resumes = makeResumeFiles(8);
     let cancelled = false;

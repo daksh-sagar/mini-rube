@@ -67,11 +67,10 @@ const workflowService = createWorkflowService({
   defaults: {
     sheetBatchSize: Number(process.env.WORKFLOW_SHEET_BATCH_SIZE ?? 100),
     pageSize: Number(process.env.WORKFLOW_PAGE_SIZE ?? 100),
-    // Concurrency for the parse/extract phase. 8 is the fast default; the per-call
-    // retry-with-backoff + deterministic fallback absorb the 429s that used to force
-    // this lower. Note: parsing runs in-process, so a large batch can briefly lag
-    // interactive chat — override with WORKFLOW_CONCURRENCY if that matters.
-    workflowConcurrency: Number(process.env.WORKFLOW_CONCURRENCY ?? 8),
+    // PDF text extraction runs in-process and is memory-heavy on small Render
+    // instances. Keep the production default sequential; override with
+    // WORKFLOW_CONCURRENCY when the host has enough headroom.
+    workflowConcurrency: Number(process.env.WORKFLOW_CONCURRENCY ?? 1),
     sheetValueMode: "googleValues",
     workerId: `server_${process.pid}`,
     // The resume prompt explicitly asks for name/university/last-job, which

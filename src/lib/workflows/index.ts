@@ -149,7 +149,7 @@ export function createWorkflowService(options: WorkflowServiceOptions) {
     sheetValueMode: options.defaults?.sheetValueMode ?? "recordRows",
     workerId: options.defaults?.workerId ?? "workflow_service",
     useLlmExtraction: options.defaults?.useLlmExtraction ?? false,
-    workflowConcurrency: positiveInteger(options.defaults?.workflowConcurrency, 8),
+    workflowConcurrency: positiveInteger(options.defaults?.workflowConcurrency, 1),
   };
 
   return {
