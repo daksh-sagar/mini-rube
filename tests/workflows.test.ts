@@ -260,7 +260,7 @@ describe("planned workflow execution", () => {
     const result = await service.runWorkflow(DRIVE_RESUMES_TO_SHEET, {
       userId: "user_limited_resumes",
       folderId: "drive_folder_limited",
-      prompt: "fetch 3 resumes from this Drive folder and write their content to a sheet",
+      prompt: "fetch exactly 3 resumes from this Drive folder and write their content to a sheet",
     });
 
     expect(result).toMatchObject({
