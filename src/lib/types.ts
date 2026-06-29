@@ -1,0 +1,90 @@
+export type ToolCatalogEntry = {
+  slug: string;
+  description: string;
+  toolkit?: string;
+};
+
+export type RoutingMode =
+  | "deterministic"
+  | "llm_refined"
+  | "catalog_llm"
+  | "catalog_lexical"
+  | "none";
+
+export type RouteToolsResult = {
+  slugs: string[];
+  rationale: string;
+  intentIds?: string[];
+  confidence?: number;
+  routingMode?: RoutingMode;
+  scores?: Array<{ intentId: string; score: number }>;
+};
+
+export type RouteToolsOptions = {
+  catalog?: ToolCatalogEntry[];
+  maxTools?: number;
+  maxIntents?: number;
+  useLLM?: boolean;
+  /**
+   * Enables LLM/lexical discovery over the full catalog when the deterministic
+   * registry route is low-confidence or empty. Defaults to `useLLM`, so the
+   * deterministic-only tests stay deterministic.
+   */
+  discovery?: boolean;
+  forceRefreshCatalog?: boolean;
+  connectedToolkits?: string[];
+};
+
+export type ComposioToolSchema = {
+  slug?: string;
+  name?: string;
+  description?: string;
+  inputParameters?: unknown;
+  input_parameters?: unknown;
+  [key: string]: unknown;
+};
+
+export type RunTraceEntry = {
+  id: string;
+  at: string;
+  type: "plan" | "tool" | "confirmation" | "error" | "info";
+  title: string;
+  detail?: string;
+  toolSlug?: string;
+  args?: unknown;
+  resultPreview?: unknown;
+};
+
+export type ActionDetail = { label: string; value: string };
+
+export type PendingAction = {
+  id: string;
+  userId: string;
+  runId: string;
+  toolSlug: string;
+  args: Record<string, unknown>;
+  summary: string;
+  /** Human-readable one-line description of the action, safe to show in the UI. */
+  actionTitle: string;
+  /** Key fields of the action (already redacted) for the confirmation card. */
+  actionDetails: ActionDetail[];
+  status: "pending" | "executed" | "failed";
+  createdAt: string;
+  executedAt?: string;
+  result?: unknown;
+  error?: string;
+};
+
+export type RunState = {
+  id: string;
+  userId: string;
+  status: "running" | "waiting_confirmation" | "completed" | "failed" | "cancelled";
+  prompt: string;
+  selectedTools: string[];
+  rationale: string;
+  startedAt: string;
+  updatedAt: string;
+  traces: RunTraceEntry[];
+  pendingActions: string[];
+  artifacts: Array<{ label: string; url?: string; value?: unknown }>;
+};

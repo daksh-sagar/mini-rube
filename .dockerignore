@@ -1,0 +1,8 @@
+.DS_Store
+.env
+.env.local
+.git
+.mini-rube
+.playwright-cli
+node_modules
+src/app/dist

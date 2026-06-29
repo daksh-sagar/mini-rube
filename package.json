@@ -1,0 +1,30 @@
+{
+  "name": "mini-rube",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "check": "tsc --noEmit",
+    "dev": "bun --hot src/server.ts & vite",
+    "server": "bun --hot src/server.ts",
+    "start": "NODE_ENV=production bun src/server.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^1",
+    "@ai-sdk/react": "^1",
+    "@composio/core": "^0.2.6",
+    "ai": "^4",
+    "react": "^19",
+    "react-dom": "^19",
+    "unpdf": "^1.6.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^4",
+    "typescript": "^5",
+    "vite": "^6"
+  }
+}
